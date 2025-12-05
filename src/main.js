@@ -342,16 +342,55 @@ async function main() {
         }
 
         function findNextPage($, base, currentPage) {
-            // Allrecipes search uses pagination with page numbers
-            const nextPageNum = currentPage + 1;
-            const u = new URL(base);
-            u.searchParams.set('page', String(nextPageNum));
-            
-            // Check if next page button exists
-            const hasNext = $('a[aria-label*="next"], .pagination__next, button[aria-label*="next"]').length > 0;
-            if (hasNext) return u.href;
-            
-            return null;
+            const candidates = new Set();
+            const addHref = (href) => {
+                const abs = toAbs(href, base);
+                if (abs) candidates.add(abs);
+            };
+
+            // Explicit rel=next
+            const relNext = $('link[rel="next"], a[rel="next"]').attr('href');
+            if (relNext) addHref(relNext);
+
+            // Specific Allrecipes pagination component
+            const mntlNext = $('span.mntl-pagination__next-text').closest('a, button').attr('href');
+            if (mntlNext) addHref(mntlNext);
+
+            // Elements that suggest "next"
+            $('a[aria-label], button[aria-label]').each((_, el) => {
+                const label = ($(el).attr('aria-label') || '').toLowerCase();
+                if (label.includes('next')) addHref($(el).attr('href'));
+            });
+            $('a, button').each((_, el) => {
+                const text = cleanText($(el).text() || '').toLowerCase();
+                if (text.includes('next')) addHref($(el).attr('href'));
+            });
+
+            // Any page query param > current
+            $('a[href*="page="]').each((_, el) => {
+                const href = $(el).attr('href');
+                if (!href) return;
+                const abs = toAbs(href, base);
+                if (!abs) return;
+                try {
+                    const u = new URL(abs);
+                    const page = Number(u.searchParams.get('page'));
+                    if (Number.isFinite(page) && page > currentPage) candidates.add(abs);
+                } catch { /* ignore bad urls */ }
+            });
+
+            // Fallback: increment page param on current URL
+            const fallbackUrl = (() => {
+                try {
+                    const u = new URL(base);
+                    u.searchParams.set('page', String(currentPage + 1));
+                    return u.href;
+                } catch { return null; }
+            })();
+            if (fallbackUrl) candidates.add(fallbackUrl);
+
+            const next = [...candidates][0];
+            return next || null;
         }
 
         const crawler = new CheerioCrawler({
