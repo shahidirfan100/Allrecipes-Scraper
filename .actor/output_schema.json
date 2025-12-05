@@ -1,0 +1,19 @@
+{
+  "actorOutputSchemaVersion": 1,
+  "title": "Dataset contains recipes scraped from Allrecipes.com",
+  "type": "object",
+  "properties": {
+    "overview": {
+      "type": "string",
+      "title": "Overview",
+      "description": "Quick overview of scraped recipes",
+      "template": "{{links.apiDefaultDatasetUrl}}/items?view=overview"
+    },
+    "detailed": {
+      "type": "string",
+      "title": "Detailed View",
+      "description": "Full recipe details with ingredients and instructions",
+      "template": "{{links.apiDefaultDatasetUrl}}/items?view=detailed"
+    }
+  }
+}

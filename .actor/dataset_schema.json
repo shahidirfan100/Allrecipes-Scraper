@@ -1,0 +1,155 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "name",
+          "author",
+          "rating",
+          "prepTime",
+          "cookTime",
+          "totalTime",
+          "servings",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "name": {
+            "label": "Recipe Name",
+            "format": "text"
+          },
+          "author": {
+            "label": "Author",
+            "format": "text"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "object"
+          },
+          "prepTime": {
+            "label": "Prep Time",
+            "format": "text"
+          },
+          "cookTime": {
+            "label": "Cook Time",
+            "format": "text"
+          },
+          "totalTime": {
+            "label": "Total Time",
+            "format": "text"
+          },
+          "servings": {
+            "label": "Servings",
+            "format": "text"
+          },
+          "url": {
+            "label": "Recipe URL",
+            "format": "link"
+          }
+        }
+      }
+    },
+    "detailed": {
+      "title": "Detailed View",
+      "transformation": {
+        "fields": [
+          "name",
+          "description",
+          "image",
+          "author",
+          "rating",
+          "prepTime",
+          "cookTime",
+          "totalTime",
+          "servings",
+          "ingredients",
+          "instructions",
+          "category",
+          "cuisine",
+          "keywords",
+          "nutrition",
+          "url",
+          "scrapedAt"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "name": {
+            "label": "Recipe Name",
+            "format": "text"
+          },
+          "description": {
+            "label": "Description",
+            "format": "text"
+          },
+          "image": {
+            "label": "Image",
+            "format": "image"
+          },
+          "author": {
+            "label": "Author",
+            "format": "text"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "object"
+          },
+          "prepTime": {
+            "label": "Prep Time",
+            "format": "text"
+          },
+          "cookTime": {
+            "label": "Cook Time",
+            "format": "text"
+          },
+          "totalTime": {
+            "label": "Total Time",
+            "format": "text"
+          },
+          "servings": {
+            "label": "Servings",
+            "format": "text"
+          },
+          "ingredients": {
+            "label": "Ingredients",
+            "format": "array"
+          },
+          "instructions": {
+            "label": "Instructions",
+            "format": "array"
+          },
+          "category": {
+            "label": "Category",
+            "format": "text"
+          },
+          "cuisine": {
+            "label": "Cuisine",
+            "format": "text"
+          },
+          "keywords": {
+            "label": "Keywords",
+            "format": "text"
+          },
+          "nutrition": {
+            "label": "Nutrition Info",
+            "format": "object"
+          },
+          "url": {
+            "label": "Recipe URL",
+            "format": "link"
+          },
+          "scrapedAt": {
+            "label": "Scraped At",
+            "format": "text"
+          }
+        }
+      }
+    }
+  }
+}
