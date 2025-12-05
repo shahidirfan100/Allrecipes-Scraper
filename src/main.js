@@ -398,6 +398,10 @@ async function main() {
             maxRequestRetries: 3,
             useSessionPool: true,
             maxConcurrency: 10, // modest bump for speed while keeping it stealthy
+            minConcurrency: 5,  // keep floor to avoid aggressive autoscale downs
+            autoscaledPoolOptions: {
+                desiredConcurrency: 10,
+            },
             requestHandlerTimeoutSecs: 90,
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
                 const label = request.userData?.label || 'LIST';
