@@ -397,7 +397,7 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 3,
             useSessionPool: true,
-            maxConcurrency: 5,
+            maxConcurrency: 10, // modest bump for speed while keeping it stealthy
             requestHandlerTimeoutSecs: 90,
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
                 const label = request.userData?.label || 'LIST';
