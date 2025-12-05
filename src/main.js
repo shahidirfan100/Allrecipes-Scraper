@@ -32,6 +32,65 @@ async function main() {
             return $.root().text().replace(/\s+/g, ' ').trim();
         };
 
+        const safeJsonParse = (text) => {
+            try { return JSON.parse(text); } catch { return null; }
+        };
+
+        const asArray = (value) => (Array.isArray(value) ? value : value ? [value] : []);
+        const uniq = (arr) => [...new Set((arr || []).filter(Boolean))];
+
+        const normalizeInstructions = (instructions) => {
+            const steps = [];
+            const walk = (node) => {
+                if (!node) return;
+                if (Array.isArray(node)) {
+                    node.forEach(walk);
+                    return;
+                }
+                if (typeof node === 'string') {
+                    const t = cleanText(node);
+                    if (t) steps.push(t);
+                    return;
+                }
+                if (Array.isArray(node.itemListElement)) {
+                    walk(node.itemListElement);
+                    return;
+                }
+                const text = node.text || node.name || node.description;
+                if (text) {
+                    const t = cleanText(text);
+                    if (t) steps.push(t);
+                }
+            };
+
+            walk(instructions);
+            return steps;
+        };
+
+        const normalizeRating = (aggregateRating) => {
+            if (!aggregateRating) return null;
+            const ratingValue = aggregateRating.ratingValue ?? aggregateRating.rating ?? aggregateRating.value ?? null;
+            const ratingCount = aggregateRating.ratingCount ?? aggregateRating.reviewCount ?? aggregateRating.ratingVotes ?? aggregateRating.count ?? null;
+            if (!ratingValue && !ratingCount) return null;
+            return {
+                ratingValue: ratingValue ?? null,
+                ratingCount: ratingCount ?? null,
+                reviewCount: aggregateRating.reviewCount ?? ratingCount ?? null,
+            };
+        };
+
+        const mergeRecipeData = (primary = {}, fallback = {}) => {
+            const merged = { ...primary };
+            for (const [key, value] of Object.entries(fallback)) {
+                const current = merged[key];
+                const isEmptyArray = Array.isArray(current) && current.length === 0;
+                if (current === undefined || current === null || current === '' || isEmptyArray) {
+                    merged[key] = value;
+                }
+            }
+            return merged;
+        };
+
         const buildStartUrl = (searchQuery) => {
             const u = new URL('https://www.allrecipes.com/search');
             if (searchQuery) u.searchParams.set('q', String(searchQuery).trim());
@@ -98,36 +157,164 @@ async function main() {
 
         function extractRecipeFromJsonLd($) {
             const scripts = $('script[type="application/ld+json"]');
+            const candidates = [];
+
             for (let i = 0; i < scripts.length; i++) {
-                try {
-                    const parsed = JSON.parse($(scripts[i]).html() || '');
-                    const arr = Array.isArray(parsed) ? parsed : [parsed];
-                    for (const e of arr) {
-                        if (!e) continue;
-                        const t = e['@type'] || e.type;
-                        if (t === 'Recipe' || (Array.isArray(t) && t.includes('Recipe'))) {
-                            return {
-                                name: e.name || null,
-                                description: e.description || null,
-                                image: e.image?.url || e.image || null,
-                                prepTime: e.prepTime || null,
-                                cookTime: e.cookTime || null,
-                                totalTime: e.totalTime || null,
-                                recipeYield: e.recipeYield || null,
-                                recipeIngredient: e.recipeIngredient || [],
-                                recipeInstructions: e.recipeInstructions || [],
-                                aggregateRating: e.aggregateRating || null,
-                                author: e.author?.name || e.author || null,
-                                recipeCategory: e.recipeCategory || null,
-                                recipeCuisine: e.recipeCuisine || null,
-                                keywords: e.keywords || null,
-                                nutrition: e.nutrition || null,
-                            };
-                        }
-                    }
-                } catch (e) { /* ignore parsing errors */ }
+                const parsed = safeJsonParse($(scripts[i]).contents().text());
+                if (!parsed) continue;
+
+                const nodes = [];
+                nodes.push(...asArray(parsed));
+                nodes.push(...asArray(parsed['@graph']));
+                nodes.push(...asArray(parsed.graph));
+                if (parsed.mainEntity) nodes.push(parsed.mainEntity);
+                if (parsed.mainEntityOfPage) nodes.push(parsed.mainEntityOfPage);
+
+                nodes.forEach((node) => {
+                    if (!node) return;
+                    const types = asArray(node['@type'] || node.type);
+                    if (types.includes('Recipe')) candidates.push(node);
+                });
             }
-            return null;
+
+            const recipe = candidates.find((r) => r.name) || candidates[0];
+            if (!recipe) return null;
+
+            const instructions = normalizeInstructions(recipe.recipeInstructions || recipe.instructions);
+            const ingredients = asArray(recipe.recipeIngredient || recipe.ingredients).map(cleanText).filter(Boolean);
+            const rating = normalizeRating(recipe.aggregateRating);
+
+            return {
+                name: recipe.name || null,
+                description: recipe.description || null,
+                image: (typeof recipe.image === 'string' ? recipe.image : recipe.image?.url) || null,
+                prepTime: recipe.prepTime || recipe.prep_time || null,
+                cookTime: recipe.cookTime || recipe.cook_time || null,
+                totalTime: recipe.totalTime || recipe.total_time || null,
+                servings: recipe.servings || recipe.recipeYield || null,
+                recipeYield: recipe.recipeYield || recipe.servings || null,
+                recipeIngredient: ingredients.length ? ingredients : null,
+                recipeInstructions: instructions.length ? instructions : null,
+                aggregateRating: rating,
+                author: uniq(asArray(recipe.author).map((a) => (typeof a === 'string' ? a : a?.name))).join(', ') || null,
+                recipeCategory: uniq(asArray(recipe.recipeCategory)).join(', ') || null,
+                recipeCuisine: uniq(asArray(recipe.recipeCuisine)).join(', ') || null,
+                keywords: uniq(asArray(recipe.keywords || recipe.keyword)).join(', ') || null,
+                nutrition: recipe.nutrition || null,
+            };
+        }
+
+        function extractRecipeFromHtml($, pageUrl) {
+            const pickAttr = (selectors, attr) => {
+                for (const sel of selectors) {
+                    const val = $(sel).first().attr(attr);
+                    if (val && String(val).trim()) return String(val).trim();
+                }
+                return null;
+            };
+
+            const pickText = (selectors) => {
+                for (const sel of selectors) {
+                    const val = $(sel).first().text();
+                    if (val && String(val).trim()) return cleanText(val);
+                }
+                return null;
+            };
+
+            const title = pickText(['h1.article-heading', 'h1.headline', 'h1#article-heading', 'h1[data-testid="Heading"]', 'h1']);
+
+            const description = pickAttr(['meta[property="og:description"]', 'meta[name="description"]'], 'content') ||
+                pickText(['p.article-subheading', '.recipe-summary p', '.mntl-recipe-summary__content', '.article-subheading', 'p.description']);
+
+            const image = pickAttr(['meta[property="og:image"]', 'meta[name="twitter:image"]'], 'content') ||
+                pickAttr(['img.primary-image', '.recipe-image img', 'img[src*="/recipe/"]'], 'src');
+
+            let prepTime = pickAttr(['meta[itemprop="prepTime"]', 'time[itemprop="prepTime"]'], 'content') ||
+                pickAttr(['time[data-prep-time]'], 'datetime');
+            let cookTime = pickAttr(['meta[itemprop="cookTime"]', 'time[itemprop="cookTime"]'], 'content') ||
+                pickAttr(['time[data-cook-time]'], 'datetime');
+            let totalTime = pickAttr(['meta[itemprop="totalTime"]', 'time[itemprop="totalTime"]'], 'content') ||
+                pickAttr(['time[data-total-time]'], 'datetime');
+
+            let servings = pickAttr(['meta[itemprop="recipeYield"]'], 'content') ||
+                pickText(['.recipe-meta-item:contains("Servings") .recipe-meta-item-body', '#recipe-serving', '[data-ingredient-servings]']);
+
+            const ratingValueRaw = pickAttr(['meta[itemprop="ratingValue"]', 'meta[property="og:rating"]'], 'content') ||
+                pickText(['.review-star-text', '[data-rating]', '.rating-value']);
+            const ratingCountRaw = pickAttr(['meta[itemprop="ratingCount"]', 'meta[itemprop="reviewCount"]'], 'content') ||
+                pickText(['.review-count', '[data-review-count]']);
+            const aggregateRating = normalizeRating({
+                ratingValue: ratingValueRaw,
+                ratingCount: ratingCountRaw,
+                reviewCount: ratingCountRaw,
+            });
+
+            const author = pickAttr(['meta[name="author"]', 'meta[property="article:author"]'], 'content') ||
+                pickText(['[rel="author"]', '.author-name', '.mntl-attribution__item-name']);
+
+            const nutrition = {};
+            $('.mntl-nutrition-facts-summary__table .mntl-nutrition-facts-summary__item, .nutrition-summary-facts li, [data-nutrition-item]').each((_, el) => {
+                const label = cleanText($(el).find('.mntl-nutrition-facts-summary__heading, .label, .nutrition-card__label').text() || '');
+                const value = cleanText($(el).find('.mntl-nutrition-facts-summary__value, .value, .nutrition-card__value').text() || '');
+                if (label && value) nutrition[label.replace(/:$/, '')] = value;
+            });
+            const calories = pickText(['.calorie-count', '[data-calories]']);
+            if (calories && !nutrition.calories) nutrition.calories = calories;
+            const nutritionInfo = Object.keys(nutrition).length ? nutrition : null;
+
+            const ingredients = [];
+            $('.ingredients-item, .mntl-structured-ingredients__list-item, [data-ingredient], ul.ingredients li').each((_, li) => {
+                const text = cleanText($(li).text());
+                if (text) ingredients.push(text);
+            });
+
+            const instructions = [];
+            $('.instructions-section-item, .recipe-directions__list--item, #recipe__steps li, ol.instructions li').each((_, li) => {
+                const text = cleanText($(li).text());
+                if (text && text.length > 3) instructions.push(text);
+            });
+            if (!instructions.length) {
+                $('.mntl-sc-block-html').each((_, el) => {
+                    const text = cleanText($(el).text());
+                    if (text) instructions.push(text);
+                });
+            }
+
+            const breadcrumbs = $('.breadcrumbs__item a, nav.breadcrumbs a').map((_, a) => cleanText($(a).text())).get().filter(Boolean);
+            const category = breadcrumbs.length > 1 ? breadcrumbs[breadcrumbs.length - 2] : breadcrumbs[breadcrumbs.length - 1] || null;
+            const cuisine = breadcrumbs.find((b) => /cuisine|world/i.test(b)) || null;
+
+            const keywords = pickAttr(['meta[name="keywords"]'], 'content') ||
+                $('.recipe-tags a, .mntl-inline-list__item a').map((_, a) => cleanText($(a).text())).get().filter(Boolean).join(', ');
+
+            $('.recipe-meta-item, .mntl-recipe-details__item').each((_, el) => {
+                const label = cleanText($(el).find('.recipe-meta-item-header, .mntl-recipe-details__item-label').text()).toLowerCase();
+                const value = cleanText($(el).find('.recipe-meta-item-body, .mntl-recipe-details__item-value').text());
+                if (!label || !value) return;
+                if (!prepTime && label.includes('prep')) prepTime = value;
+                if (!cookTime && label.includes('cook')) cookTime = value;
+                if (!totalTime && label.includes('total')) totalTime = value;
+                if (!servings && label.includes('servings')) servings = value;
+            });
+
+            return {
+                name: title || null,
+                description: description || null,
+                image: image ? toAbs(image, pageUrl) : null,
+                prepTime: prepTime || null,
+                cookTime: cookTime || null,
+                totalTime: totalTime || null,
+                servings: servings || null,
+                recipeYield: servings || null,
+                recipeIngredient: ingredients.length ? uniq(ingredients) : null,
+                recipeInstructions: instructions.length ? uniq(instructions) : null,
+                aggregateRating,
+                author: author || null,
+                recipeCategory: category || null,
+                recipeCuisine: cuisine || null,
+                keywords: keywords || null,
+                nutrition: nutritionInfo,
+            };
         }
 
         function findRecipeLinks($, base) {
@@ -202,65 +389,10 @@ async function main() {
                     if (saved >= RESULTS_WANTED) return;
                     
                     try {
-                        // Priority 1: Try JSON-LD structured data
-                        let recipeData = extractRecipeFromJsonLd($);
-                        
-                        // Priority 2: Fallback to HTML parsing if JSON-LD not available
-                        if (!recipeData || !recipeData.name) {
-                            crawlerLog.info(`JSON-LD not found for ${request.url}, falling back to HTML parsing`);
-                            recipeData = {};
-                            
-                            // Extract recipe name
-                            recipeData.name = $('h1.article-heading, h1.headline, h1').first().text().trim() || null;
-                            
-                            // Extract description
-                            recipeData.description = $('p.article-subheading, .recipe-summary, p.description').first().text().trim() || null;
-                            
-                            // Extract image
-                            const imgSrc = $('img.primary-image, .recipe-image img, img[src*="recipe"]').first().attr('src');
-                            recipeData.image = imgSrc ? toAbs(imgSrc, request.url) : null;
-                            
-                            // Extract times
-                            recipeData.prepTime = $('[data-unit*="min"]:contains("Prep"), .recipe-meta-item:contains("Prep Time")').first().text().trim() || null;
-                            recipeData.cookTime = $('[data-unit*="min"]:contains("Cook"), .recipe-meta-item:contains("Cook Time")').first().text().trim() || null;
-                            recipeData.totalTime = $('[data-unit*="min"]:contains("Total"), .recipe-meta-item:contains("Total Time")').first().text().trim() || null;
-                            
-                            // Extract servings/yield
-                            recipeData.recipeYield = $('[data-unit="serving"], .recipe-meta-item:contains("Servings"), #recipe-serving').first().text().trim() || null;
-                            
-                            // Extract ingredients
-                            const ingredients = [];
-                            $('li.mntl-structured-ingredients__list-item, .ingredients-item, [data-ingredient], ul.ingredients li').each((_, li) => {
-                                const text = $(li).text().trim();
-                                if (text) ingredients.push(text);
-                            });
-                            recipeData.recipeIngredient = ingredients.length > 0 ? ingredients : null;
-                            
-                            // Extract instructions
-                            const instructions = [];
-                            $('#recipe__steps li, .recipe-directions li, [data-instruction], ol.instructions li, .mntl-sc-block-html').each((_, li) => {
-                                const text = $(li).text().trim();
-                                if (text && text.length > 5) instructions.push(text);
-                            });
-                            recipeData.recipeInstructions = instructions.length > 0 ? instructions : null;
-                            
-                            // Extract rating
-                            const ratingValue = $('[data-rating], .rating-value, meta[itemprop="ratingValue"]').first().attr('content') || 
-                                               $('[data-rating], .rating-value').first().text().trim();
-                            const reviewCount = $('[data-review-count], .review-count, meta[itemprop="reviewCount"]').first().attr('content') || 
-                                               $('[data-review-count], .review-count').first().text().trim();
-                            
-                            if (ratingValue || reviewCount) {
-                                recipeData.aggregateRating = {
-                                    ratingValue: ratingValue || null,
-                                    reviewCount: reviewCount || null
-                                };
-                            }
-                            
-                            // Extract author
-                            recipeData.author = $('[rel="author"], .author-name, meta[name="author"]').first().attr('content') || 
-                                               $('[rel="author"], .author-name').first().text().trim() || null;
-                        }
+                        const jsonRecipe = extractRecipeFromJsonLd($) || {};
+                        const htmlRecipe = extractRecipeFromHtml($, request.url) || {};
+                        const recipeData = mergeRecipeData(jsonRecipe, htmlRecipe);
+                        const rating = normalizeRating(recipeData.aggregateRating);
 
                         const item = {
                             name: recipeData.name || null,
@@ -269,12 +401,12 @@ async function main() {
                             prepTime: recipeData.prepTime || null,
                             cookTime: recipeData.cookTime || null,
                             totalTime: recipeData.totalTime || null,
-                            servings: recipeData.recipeYield || null,
+                            servings: recipeData.servings || recipeData.recipeYield || null,
                             ingredients: recipeData.recipeIngredient || [],
                             instructions: recipeData.recipeInstructions || [],
-                            rating: recipeData.aggregateRating ? {
-                                value: recipeData.aggregateRating.ratingValue || null,
-                                count: recipeData.aggregateRating.reviewCount || recipeData.aggregateRating.ratingCount || null
+                            rating: rating ? {
+                                value: rating.ratingValue ?? null,
+                                count: rating.ratingCount ?? rating.reviewCount ?? null
                             } : null,
                             author: recipeData.author || null,
                             category: recipeData.recipeCategory || null,
@@ -296,7 +428,7 @@ async function main() {
         });
 
         await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
-        log.info(`✓ Scraping completed. Total recipes saved: ${saved}`);
+        log.info(`Scraping completed. Total recipes saved: ${saved}`);
     } finally {
         await Actor.exit();
     }
