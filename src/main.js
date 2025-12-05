@@ -322,8 +322,8 @@ async function main() {
             $('a[href]').each((_, a) => {
                 const href = $(a).attr('href');
                 if (!href) return;
-                // Allrecipes recipe URLs typically contain /recipe/
-                if (/\/recipe\/\d+/i.test(href) || /allrecipes\.com\/recipe/i.test(href)) {
+                // Allrecipes recipe URLs always contain /recipe/<id>/
+                if (/\/recipe\/\d+/i.test(href)) {
                     const abs = toAbs(href, base);
                     if (abs && !abs.includes('#')) links.add(abs);
                 }
@@ -389,10 +389,37 @@ async function main() {
                     if (saved >= RESULTS_WANTED) return;
                     
                     try {
+                        // Safety: if a non-recipe URL slipped in, treat page as listing
+                        if (!/\/recipe\/\d+/i.test(request.url)) {
+                            const links = findRecipeLinks($, request.url);
+                            if (links.length) {
+                                const remaining = RESULTS_WANTED - saved;
+                                const toEnqueue = links.slice(0, Math.max(0, remaining));
+                                if (toEnqueue.length) {
+                                    await enqueueLinks({ urls: toEnqueue, userData: { label: 'RECIPE' } });
+                                    crawlerLog.info(`Reclassified ${request.url} as LIST; enqueued ${toEnqueue.length} recipes`);
+                                }
+                            }
+                            return;
+                        }
+
                         const jsonRecipe = extractRecipeFromJsonLd($) || {};
                         const htmlRecipe = extractRecipeFromHtml($, request.url) || {};
                         const recipeData = mergeRecipeData(jsonRecipe, htmlRecipe);
                         const rating = normalizeRating(recipeData.aggregateRating);
+
+                        if (!recipeData.name && !recipeData.recipeIngredient && !recipeData.recipeInstructions) {
+                            const links = findRecipeLinks($, request.url);
+                            if (links.length) {
+                                const remaining = RESULTS_WANTED - saved;
+                                const toEnqueue = links.slice(0, Math.max(0, remaining));
+                                if (toEnqueue.length) {
+                                    await enqueueLinks({ urls: toEnqueue, userData: { label: 'RECIPE' } });
+                                    crawlerLog.info(`Recipe data not found; treating ${request.url} as LIST and enqueuing ${toEnqueue.length} recipes`);
+                                }
+                            }
+                            return;
+                        }
 
                         const item = {
                             name: recipeData.name || null,
