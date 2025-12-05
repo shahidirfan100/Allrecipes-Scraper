@@ -9,7 +9,6 @@
       "type": "array",
       "description": "Array of Allrecipes URLs to scrape. If provided, this overrides the search query. Useful for scraping specific recipe categories or collections.",
       "editor": "requestListSources",
-      "placeholderValue": [{"url": "https://www.allrecipes.com/search?q=Chicken"}],
       "prefill": [{"url": "https://www.allrecipes.com/search?q=Chicken"}]
     },
     "query": {
