@@ -23,9 +23,7 @@
       "title": "Maximum Recipes",
       "type": "integer",
       "description": "Maximum number of recipes to extract. Set higher for comprehensive results.",
-      "minimum": 1,
-      "maximum": 1000,
-      "default": 50,
+      "default": 20,
       "editor": "number",
       "example": 50
     },
@@ -33,9 +31,7 @@
       "title": "Maximum Pages to Crawl",
       "type": "integer",
       "description": "Limits the number of search result pages to process. Helps control scraping time and resource usage.",
-      "minimum": 1,
-      "maximum": 50,
-      "default": 10,
+      "default": 5,
       "editor": "number",
       "example": 10
     },
@@ -45,8 +41,7 @@
       "description": "Configure proxy settings to avoid rate limiting. Residential proxies recommended for best results.",
       "editor": "proxy",
       "default": {
-        "useApifyProxy": true,
-        "apifyProxyGroups": ["RESIDENTIAL"]
+        "useApifyProxy": false
       }
     }
   },
