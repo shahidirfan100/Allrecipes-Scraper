@@ -24,6 +24,7 @@
       "type": "integer",
       "description": "Maximum number of recipes to extract. Set higher for comprehensive results.",
       "default": 20,
+      "prefill": 20,
       "editor": "number",
       "example": 50
     },
@@ -32,6 +33,7 @@
       "type": "integer",
       "description": "Limits the number of search result pages to process. Helps control scraping time and resource usage.",
       "default": 5,
+      "prefill": 5,
       "editor": "number",
       "example": 10
     },

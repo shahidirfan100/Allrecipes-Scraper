@@ -3,6 +3,7 @@ import { Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 import { gotScraping } from 'got-scraping';
 import { CookieJar } from 'tough-cookie';
+import { readFile } from 'node:fs/promises';
 
 const BASE_URL = 'https://www.allrecipes.com';
 const SEARCH_COMPONENTS = 'mntl-search-results__list_1,mntl-pagination_1';
@@ -19,6 +20,8 @@ const RECIPE_COMPONENTS = [
     'mm-recipes-nutrition-facts_1',
 ].join(',');
 const SEARCH_PAGE_SIZE = 24;
+const RECIPE_CONCURRENCY = 8;
+const DATASET_BATCH_SIZE = 25;
 
 function asArray(value) {
     if (Array.isArray(value)) return value;
@@ -39,6 +42,21 @@ function parseResponseBody(body) {
     } catch {
         return {};
     }
+}
+
+async function loadInputJsonFallback() {
+    try {
+        const raw = await readFile('INPUT.json', 'utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+        return {};
+    } catch {
+        return {};
+    }
+}
+
+function hasAnyInputFields(value) {
+    return !!(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0);
 }
 
 function parseNumber(value) {
@@ -364,13 +382,20 @@ function extractRecipeData(recipeUrl, payload) {
         instructionImages,
         details: detailMap,
         nutrition,
-        apiComponents: Object.keys(payload).filter((key) => !['externalScripts', 'externalStylesheets', 'inlineSVGs'].includes(key)),
         scrapedAt: new Date().toISOString(),
     };
 }
 
 async function main() {
-    const input = (await Actor.getInput()) || {};
+    const actorInput = (await Actor.getInput()) || {};
+    const input = hasAnyInputFields(actorInput)
+        ? actorInput
+        : await loadInputJsonFallback();
+
+    if (!hasAnyInputFields(actorInput) && hasAnyInputFields(input)) {
+        log.info('No actor input detected. Using INPUT.json fallback.');
+    }
+
     const {
         query,
         startUrls,
@@ -516,7 +541,6 @@ async function main() {
             const recipeUrls = parseSearchLinks(listHtml);
 
             if (!recipeUrls.length) {
-                log.info(`No more search results for "${queryValue}" at offset=${offset}.`);
                 break;
             }
 
@@ -528,12 +552,12 @@ async function main() {
                 added++;
             }
 
-            log.info(`Search page ${page + 1} (offset ${offset}) returned ${recipeUrls.length} links, added ${added}. Total queued: ${collectedRecipeUrls.size}`);
-
             if (recipeUrls.length < SEARCH_PAGE_SIZE) {
                 break;
             }
         }
+
+        log.info(`Queued ${collectedRecipeUrls.size} recipe URLs so far for query "${queryValue}".`);
     }
 
     const recipeQueue = [...collectedRecipeUrls].slice(0, resultsWanted);
@@ -543,14 +567,25 @@ async function main() {
         return;
     }
 
-    log.info(`Processing ${recipeQueue.length} recipe URLs via component API.`);
+    const canonicalQueue = [];
+    const seenCanonical = new Set();
+    for (const recipeUrl of recipeQueue) {
+        const canonical = canonicalRecipeUrl(recipeUrl);
+        if (!canonical || seenCanonical.has(canonical)) continue;
+        seenCanonical.add(canonical);
+        canonicalQueue.push(canonical);
+    }
 
-    const pushedCanonical = new Set();
-    let saved = 0;
+    if (!canonicalQueue.length) {
+        log.warning('No canonical recipe URLs available for processing.');
+        return;
+    }
 
-    async function fetchRecipePayload(recipeUrl) {
-        const session = await createSession(recipeUrl);
+    log.info(`Processing ${canonicalQueue.length} recipe URLs via component API (concurrency=${RECIPE_CONCURRENCY}, batch=${DATASET_BATCH_SIZE}).`);
 
+    const sharedRecipeSession = await createSession(BASE_URL);
+
+    async function postRecipePayload(recipeUrl, session) {
         const endpoint = `${recipeUrl}?url=${encodeURIComponent(recipeUrl)}`;
         const body = new URLSearchParams({
             globeDeferVersion: '2',
@@ -577,6 +612,18 @@ async function main() {
             },
         });
 
+        return response;
+    }
+
+    async function fetchRecipePayload(recipeUrl) {
+        let response = await postRecipePayload(recipeUrl, sharedRecipeSession);
+
+        // Fallback session for blocked/expired shared-cookie requests.
+        if (response.statusCode >= 400) {
+            const fallbackSession = await createSession(recipeUrl);
+            response = await postRecipePayload(recipeUrl, fallbackSession);
+        }
+
         if (response.statusCode >= 400) {
             throw new Error(`Recipe API failed (${response.statusCode}) for ${recipeUrl}`);
         }
@@ -584,27 +631,53 @@ async function main() {
         return parseResponseBody(response.body);
     }
 
-    for (const recipeUrl of recipeQueue) {
-        const canonical = canonicalRecipeUrl(recipeUrl);
-        if (!canonical || pushedCanonical.has(canonical)) continue;
+    let saved = 0;
+    let failed = 0;
+    const failureSamples = [];
+    const pendingBatch = [];
 
-        try {
-            const payload = await fetchRecipePayload(canonical);
-            const extracted = extractRecipeData(canonical, payload);
-            const cleaned = removeNullishDeep(extracted);
+    for (let offset = 0; offset < canonicalQueue.length; offset += RECIPE_CONCURRENCY) {
+        const chunk = canonicalQueue.slice(offset, offset + RECIPE_CONCURRENCY);
 
-            if (!cleaned || (!cleaned.name && !cleaned.ingredients && !cleaned.instructions)) {
-                log.warning(`Skipping ${canonical} because no usable fields were extracted.`);
-                continue;
+        const chunkResults = await Promise.all(chunk.map(async (canonical) => {
+            try {
+                const payload = await fetchRecipePayload(canonical);
+                const extracted = extractRecipeData(canonical, payload);
+                const cleaned = removeNullishDeep(extracted);
+
+                if (!cleaned || (!cleaned.name && !cleaned.ingredients && !cleaned.instructions)) {
+                    return null;
+                }
+
+                return cleaned;
+            } catch (error) {
+                failed++;
+                if (failureSamples.length < 3) {
+                    failureSamples.push(`${canonical} (${error.message})`);
+                }
+                return null;
             }
+        }));
 
-            await Dataset.pushData(cleaned);
-            pushedCanonical.add(canonical);
-            saved++;
-            log.info(`Saved ${saved}/${recipeQueue.length}: ${cleaned.name || canonical}`);
-        } catch (error) {
-            log.warning(`Failed recipe ${canonical}: ${error.message}`);
+        pendingBatch.push(...chunkResults.filter(Boolean));
+
+        while (pendingBatch.length >= DATASET_BATCH_SIZE) {
+            const batch = pendingBatch.splice(0, DATASET_BATCH_SIZE);
+            await Dataset.pushData(batch);
+            saved += batch.length;
+            log.info(`Saved ${saved}/${canonicalQueue.length} recipes.`);
         }
+    }
+
+    if (pendingBatch.length) {
+        await Dataset.pushData(pendingBatch);
+        saved += pendingBatch.length;
+        log.info(`Saved ${saved}/${canonicalQueue.length} recipes.`);
+    }
+
+    if (failed > 0) {
+        const sampleText = failureSamples.length ? ` Samples: ${failureSamples.join(' | ')}` : '';
+        log.warning(`Failed ${failed} recipe requests.${sampleText}`);
     }
 
     log.info(`Done. Saved ${saved} unique recipes (null/duplicate fields cleaned).`);
