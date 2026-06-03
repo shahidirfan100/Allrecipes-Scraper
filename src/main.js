@@ -25,6 +25,19 @@ const RECIPE_CONCURRENCY = 8;
 const DATASET_BATCH_SIZE = 25;
 const DEFAULT_RESULTS_WANTED = 20;
 const DEFAULT_MAX_PAGES = 5;
+const MAX_RECOVERY_ATTEMPTS = 2;
+const HEADER_GENERATOR_OPTIONS = {
+    browsers: [
+        {
+            name: 'chrome',
+            minVersion: 136,
+            maxVersion: 137,
+        },
+    ],
+    devices: ['desktop'],
+    operatingSystems: ['windows'],
+    locales: ['en-US'],
+};
 const BLOCKED_BODY_PATTERNS = [
     /support@people\.inc/i,
     /reader experiencing an access issue/i,
@@ -95,6 +108,12 @@ function parseJsonCandidate(value) {
     } catch {
         return null;
     }
+}
+
+function delay(ms) {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
 }
 
 function canonicalRecipeUrl(rawUrl) {
@@ -554,36 +573,44 @@ async function main() {
             throwHttpErrors: false,
             responseType: options.responseType || 'text',
             timeout: { request: 45000 },
+            headerGeneratorOptions: HEADER_GENERATOR_OPTIONS,
         });
     };
 
     const requestWithRecovery = async (options, contextLabel) => {
-        let response;
-
-        try {
-            response = await executeRequest(options, proxyConfig);
-        } catch (error) {
-            log.warning(`${contextLabel} failed before response: ${error.message}`);
-        }
-
-        if (response && response.statusCode < 400 && !isBlockedBody(response.body)) {
-            return response;
-        }
-
+        const proxyChain = [proxyConfig];
         const fallbackProxyConfig = await getFallbackProxyConfig();
-        if (!fallbackProxyConfig) {
-            if (response) return response;
-            throw new Error(`${contextLabel} failed without a response.`);
+        if (fallbackProxyConfig) proxyChain.push(fallbackProxyConfig);
+
+        let lastResponse;
+        let lastError;
+
+        for (const [proxyIndex, activeProxyConfig] of proxyChain.entries()) {
+            for (let attempt = 1; attempt <= MAX_RECOVERY_ATTEMPTS; attempt++) {
+                try {
+                    const response = await executeRequest(options, activeProxyConfig);
+                    if (response.statusCode < 400 && !isBlockedBody(response.body)) {
+                        return response;
+                    }
+
+                    lastResponse = response;
+                    log.warning(`${contextLabel} attempt ${attempt}/${MAX_RECOVERY_ATTEMPTS} on route ${proxyIndex + 1}/${proxyChain.length} returned ${response.statusCode}${isBlockedBody(response.body) ? ' with blocked page' : ''}.`);
+                } catch (error) {
+                    lastError = error;
+                    log.warning(`${contextLabel} attempt ${attempt}/${MAX_RECOVERY_ATTEMPTS} on route ${proxyIndex + 1}/${proxyChain.length} failed: ${error.message}`);
+                }
+
+                if (attempt < MAX_RECOVERY_ATTEMPTS) {
+                    await delay(500 * attempt);
+                }
+            }
         }
 
-        log.warning(`${contextLabel} was blocked or returned ${response?.statusCode ?? 'no response'}. Retrying with Apify Proxy fallback.`);
-
-        const fallbackResponse = await executeRequest(options, fallbackProxyConfig);
-        if (isBlockedBody(fallbackResponse.body)) {
-            log.warning(`${contextLabel} still returned a blocked access page after proxy fallback.`);
+        if (lastResponse) {
+            return lastResponse;
         }
 
-        return fallbackResponse;
+        throw new Error(`${contextLabel} failed without a response.${lastError ? ` Last error: ${lastError.message}` : ''}`);
     };
 
     const startUrlValues = asArray(startUrls)
@@ -629,13 +656,13 @@ async function main() {
             url,
             cookieJar,
             headers: {
-                accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'accept-language': 'en-US,en;q=0.9',
+                referer: BASE_URL,
             },
         }, `Session bootstrap for ${url}`);
 
         if (response.statusCode >= 400 || isBlockedBody(response.body)) {
-            throw new Error(`Session bootstrap failed (${response.statusCode}) for ${url}`);
+            log.warning(`Session bootstrap failed (${response.statusCode}) for ${url}. Continuing without session-bound API access.`);
+            return { cookieJar, csrfToken: '', unavailable: true };
         }
 
         const cookies = await cookieJar.getCookies(url);
@@ -648,6 +675,22 @@ async function main() {
         const searchUrl = new URL('/search', BASE_URL);
         searchUrl.searchParams.set('q', queryValue);
         if (offset) searchUrl.searchParams.set('offset', String(offset));
+
+        if (session?.unavailable) {
+            log.warning(`Skipping search API for "${queryValue}" offset=${offset} because session bootstrap was unavailable.`);
+            const fallbackResponse = await requestWithRecovery({
+                url: searchUrl.toString(),
+                headers: {
+                    referer: BASE_URL,
+                },
+            }, `Search HTML for "${queryValue}" offset=${offset}`);
+
+            if (fallbackResponse.statusCode >= 400 || isBlockedBody(fallbackResponse.body)) {
+                throw new Error(`Search discovery failed (${fallbackResponse.statusCode}) for query="${queryValue}" offset=${offset}`);
+            }
+
+            return typeof fallbackResponse.body === 'string' ? fallbackResponse.body : '';
+        }
 
         const endpoint = new URL('/search', BASE_URL);
         endpoint.searchParams.set('q', queryValue);
@@ -670,12 +713,10 @@ async function main() {
             cookieJar: session.cookieJar,
             body: body.toString(),
             headers: {
-                accept: 'application/json, text/javascript, */*; q=0.01',
-                'x-requested-with': 'XMLHttpRequest',
-                'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
                 origin: BASE_URL,
                 referer: searchUrl.toString(),
-                'accept-language': 'en-US,en;q=0.9',
+                'x-requested-with': 'XMLHttpRequest',
+                'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
             },
         }, `Search API for "${queryValue}" offset=${offset}`);
 
@@ -692,8 +733,7 @@ async function main() {
         const fallbackResponse = await requestWithRecovery({
             url: searchUrl.toString(),
             headers: {
-                accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'accept-language': 'en-US,en;q=0.9',
+                referer: BASE_URL,
             },
         }, `Search HTML for "${queryValue}" offset=${offset}`);
 
@@ -713,26 +753,30 @@ async function main() {
         searchUrl.searchParams.set('q', queryValue);
         const session = await createSession(searchUrl.toString());
 
-        for (let page = 0; page < maxPages; page++) {
-            if (collectedRecipeUrls.size >= resultsWanted) break;
-
-            const offset = page * SEARCH_PAGE_SIZE;
-            const listHtml = await fetchSearchPage(queryValue, offset, session);
-            const recipeUrls = parseSearchLinks(listHtml);
-
-            if (!recipeUrls.length) {
-                break;
-            }
-
-            for (const recipeUrl of recipeUrls) {
+        try {
+            for (let page = 0; page < maxPages; page++) {
                 if (collectedRecipeUrls.size >= resultsWanted) break;
-                if (collectedRecipeUrls.has(recipeUrl)) continue;
-                collectedRecipeUrls.add(recipeUrl);
-            }
 
-            if (recipeUrls.length < SEARCH_PAGE_SIZE) {
-                break;
+                const offset = page * SEARCH_PAGE_SIZE;
+                const listHtml = await fetchSearchPage(queryValue, offset, session);
+                const recipeUrls = parseSearchLinks(listHtml);
+
+                if (!recipeUrls.length) {
+                    break;
+                }
+
+                for (const recipeUrl of recipeUrls) {
+                    if (collectedRecipeUrls.size >= resultsWanted) break;
+                    if (collectedRecipeUrls.has(recipeUrl)) continue;
+                    collectedRecipeUrls.add(recipeUrl);
+                }
+
+                if (recipeUrls.length < SEARCH_PAGE_SIZE) {
+                    break;
+                }
             }
+        } catch (error) {
+            log.warning(`Search discovery failed for query "${queryValue}": ${error.message}`);
         }
 
         log.info(`Queued ${collectedRecipeUrls.size} recipe URLs so far for query "${queryValue}".`);
@@ -764,6 +808,10 @@ async function main() {
     const sharedRecipeSession = await createSession(BASE_URL);
 
     async function postRecipePayload(recipeUrl, session) {
+        if (session?.unavailable) {
+            return { statusCode: 599, body: '' };
+        }
+
         const endpoint = `${recipeUrl}?url=${encodeURIComponent(recipeUrl)}`;
         const body = new URLSearchParams({
             globeDeferVersion: '2',
@@ -781,12 +829,10 @@ async function main() {
             cookieJar: session.cookieJar,
             body: body.toString(),
             headers: {
-                accept: 'application/json, text/javascript, */*; q=0.01',
-                'x-requested-with': 'XMLHttpRequest',
-                'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
                 origin: BASE_URL,
                 referer: recipeUrl,
-                'accept-language': 'en-US,en;q=0.9',
+                'x-requested-with': 'XMLHttpRequest',
+                'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
             },
         }, `Recipe API for ${recipeUrl}`);
 
@@ -797,8 +843,7 @@ async function main() {
         const response = await requestWithRecovery({
             url: recipeUrl,
             headers: {
-                accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'accept-language': 'en-US,en;q=0.9',
+                referer: BASE_URL,
             },
         }, `Recipe HTML for ${recipeUrl}`);
 
