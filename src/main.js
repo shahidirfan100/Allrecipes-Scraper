@@ -1,9 +1,10 @@
+import { readFile } from 'node:fs/promises';
+
 import { Actor, log } from 'apify';
-import { Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
+import { Dataset } from 'crawlee';
 import { gotScraping } from 'got-scraping';
 import { CookieJar } from 'tough-cookie';
-import { readFile } from 'node:fs/promises';
 
 const BASE_URL = 'https://www.allrecipes.com';
 const SEARCH_COMPONENTS = 'mntl-search-results__list_1,mntl-pagination_1';
@@ -22,6 +23,19 @@ const RECIPE_COMPONENTS = [
 const SEARCH_PAGE_SIZE = 24;
 const RECIPE_CONCURRENCY = 8;
 const DATASET_BATCH_SIZE = 25;
+const DEFAULT_RESULTS_WANTED = 20;
+const DEFAULT_MAX_PAGES = 5;
+const BLOCKED_BODY_PATTERNS = [
+    /support@people\.inc/i,
+    /reader experiencing an access issue/i,
+    /contentlicensing@people\.inc/i,
+];
+const RECIPE_COMPONENT_KEYS = [
+    'article-header--recipe_1',
+    'mm-recipes-details_1',
+    'mm-recipes-structured-ingredients_1',
+    'mm-recipes-steps_1',
+];
 
 function asArray(value) {
     if (Array.isArray(value)) return value;
@@ -42,6 +56,11 @@ function parseResponseBody(body) {
     } catch {
         return {};
     }
+}
+
+function getObjectKeys(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+    return Object.keys(value);
 }
 
 async function loadInputJsonFallback() {
@@ -68,6 +87,16 @@ function parseNumber(value) {
     return Number.isFinite(number) ? number : null;
 }
 
+function parseJsonCandidate(value) {
+    if (!value) return null;
+
+    try {
+        return JSON.parse(value);
+    } catch {
+        return null;
+    }
+}
+
 function canonicalRecipeUrl(rawUrl) {
     try {
         const parsed = new URL(rawUrl, BASE_URL);
@@ -76,7 +105,7 @@ function canonicalRecipeUrl(rawUrl) {
         parsed.search = '';
         parsed.hostname = 'www.allrecipes.com';
         parsed.protocol = 'https:';
-        parsed.pathname = parsed.pathname.replace(/\/+$/, '') + '/';
+        parsed.pathname = `${parsed.pathname.replace(/\/+$/, '')}/`;
         return parsed.toString();
     } catch {
         return null;
@@ -135,6 +164,106 @@ function removeNullishDeep(value) {
     }
 
     return value;
+}
+
+function isBlockedBody(body) {
+    if (!body) return false;
+    const text = typeof body === 'string' ? body : JSON.stringify(body);
+    return BLOCKED_BODY_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function hasRecipePayload(payload) {
+    return RECIPE_COMPONENT_KEYS.some((key) => getComponentHtml(payload, key));
+}
+
+function toStringArray(value) {
+    return uniqueStrings(asArray(value).flatMap((entry) => {
+        if (typeof entry === 'string') return [entry];
+        if (entry && typeof entry === 'object') return Object.values(entry).filter((part) => typeof part === 'string');
+        return [];
+    }));
+}
+
+function extractJsonLdObjects(html) {
+    const $ = cheerioLoad(html);
+    const objects = [];
+
+    $('script[type="application/ld+json"]').each((_, script) => {
+        const parsed = parseJsonCandidate($(script).contents().text());
+        if (!parsed) return;
+
+        if (Array.isArray(parsed)) {
+            objects.push(...parsed);
+            return;
+        }
+
+        if (Array.isArray(parsed['@graph'])) {
+            objects.push(...parsed['@graph']);
+            return;
+        }
+
+        objects.push(parsed);
+    });
+
+    return objects.filter((entry) => entry && typeof entry === 'object');
+}
+
+function matchesJsonLdType(node, expectedType) {
+    const types = asArray(node?.['@type']).map((value) => cleanText(value).toLowerCase());
+    return types.includes(expectedType.toLowerCase());
+}
+
+function extractRecipeFromJsonLd(recipeUrl, html) {
+    const objects = extractJsonLdObjects(html);
+    const recipeNode = objects.find((node) => matchesJsonLdType(node, 'Recipe'));
+
+    if (!recipeNode) {
+        return null;
+    }
+
+    const breadcrumbNode = objects.find((node) => matchesJsonLdType(node, 'BreadcrumbList'));
+    const breadcrumbs = uniqueStrings(asArray(breadcrumbNode?.itemListElement).map((entry) => cleanText(entry?.name || entry?.item?.name)));
+    const instructions = uniqueStrings(asArray(recipeNode.recipeInstructions).map((step) => {
+        if (typeof step === 'string') return step;
+        return cleanText(step?.text || step?.name);
+    }));
+    const ingredientItems = uniqueStrings(toStringArray(recipeNode.recipeIngredient)).map((text) => ({ text, name: text }));
+    const ratingValue = parseNumber(recipeNode?.aggregateRating?.ratingValue);
+    const ratingCount = parseNumber(recipeNode?.aggregateRating?.ratingCount);
+    const reviewCount = parseNumber(recipeNode?.aggregateRating?.reviewCount) || parseNumber(asArray(recipeNode.review).length);
+    const image = cleanText(
+        typeof recipeNode.image === 'string'
+            ? recipeNode.image
+            : recipeNode.image?.url || asArray(recipeNode.image)[0]?.url || asArray(recipeNode.image)[0],
+    ) || null;
+
+    return removeNullishDeep({
+        name: cleanText(recipeNode.name) || null,
+        description: cleanText(recipeNode.description) || null,
+        url: canonicalRecipeUrl(recipeNode.mainEntityOfPage || recipeNode.url || recipeUrl) || recipeUrl,
+        image,
+        author: cleanText(recipeNode.author?.name || asArray(recipeNode.author)[0]?.name) || null,
+        updatedOn: cleanText(recipeNode.dateModified) || cleanText(recipeNode.datePublished) || null,
+        breadcrumbs,
+        category: cleanText(recipeNode.recipeCategory) || breadcrumbs[breadcrumbs.length - 1] || null,
+        cuisine: cleanText(recipeNode.recipeCuisine) || null,
+        keywords: uniqueStrings(toStringArray(recipeNode.keywords)),
+        prepTime: cleanText(recipeNode.prepTime) || null,
+        cookTime: cleanText(recipeNode.cookTime) || null,
+        totalTime: cleanText(recipeNode.totalTime) || null,
+        servings: cleanText(recipeNode.recipeYield) || null,
+        rating: {
+            value: ratingValue,
+            count: ratingCount,
+            reviewCount,
+        },
+        ingredients: ingredientItems.map((item) => item.text),
+        ingredientItems,
+        instructions,
+        nutrition: recipeNode.nutrition || null,
+        scrapedAt: new Date().toISOString(),
+        source: 'jsonld-fallback',
+    });
 }
 
 function getComponentHtml(payload, key) {
@@ -217,8 +346,7 @@ function extractInstructions(stepsHtml) {
         if (stepText) instructions.push(stepText);
 
         const image = $(li).find('img').first();
-        const imageUrl =
-            cleanText(image.attr('data-hi-res-src'))
+        const imageUrl = cleanText(image.attr('data-hi-res-src'))
             || cleanText(image.attr('data-src'))
             || cleanText(image.attr('src'));
 
@@ -318,13 +446,11 @@ function extractRecipeData(recipeUrl, payload) {
             .get(),
     );
 
-    const author =
-        cleanText($meta('.mntl-bylines__group--ugc_recipe .mntl-attribution__item-name').first().text())
+    const author = cleanText($meta('.mntl-bylines__group--ugc_recipe .mntl-attribution__item-name').first().text())
         || cleanText($meta('.mntl-attribution__item-descriptor:contains("Submitted by")').next('.mntl-attribution__item-name').first().text())
         || null;
 
-    const testedBy =
-        cleanText($meta('.mntl-bylines__group--recipe_tester .mntl-attribution__item-name').first().text())
+    const testedBy = cleanText($meta('.mntl-bylines__group--recipe_tester .mntl-attribution__item-name').first().text())
         || null;
 
     const updatedOnRaw = cleanText($meta('.mntl-attribution__item-date').first().text());
@@ -335,8 +461,7 @@ function extractRecipeData(recipeUrl, payload) {
     const reviewCount = parseNumber($review('.mm-recipes-review-bar__comment-count').first().text());
     const photoCount = parseNumber($review('.recipe-review-bar__photo-count').first().text());
 
-    const image =
-        cleanText($photo('img').first().attr('data-hi-res-src'))
+    const image = cleanText($photo('img').first().attr('data-hi-res-src'))
         || cleanText($photo('img').first().attr('data-src'))
         || cleanText($photo('img').first().attr('src'))
         || null;
@@ -399,22 +524,30 @@ async function main() {
     const {
         query,
         startUrls,
-        results_wanted = 20,
-        max_pages = 5,
+        results_wanted: resultsWantedInput = DEFAULT_RESULTS_WANTED,
+        max_pages: maxPagesInput = DEFAULT_MAX_PAGES,
         proxyConfiguration,
     } = input;
 
-    const resultsWanted = Number.isFinite(Number(results_wanted)) ? Math.max(1, Number(results_wanted)) : 20;
-    const maxPages = Number.isFinite(Number(max_pages)) ? Math.max(1, Number(max_pages)) : 5;
+    const resultsWanted = Number.isFinite(Number(resultsWantedInput)) ? Math.max(1, Number(resultsWantedInput)) : DEFAULT_RESULTS_WANTED;
+    const maxPages = Number.isFinite(Number(maxPagesInput)) ? Math.max(1, Number(maxPagesInput)) : DEFAULT_MAX_PAGES;
 
     const proxyConfig = proxyConfiguration
         ? await Actor.createProxyConfiguration(proxyConfiguration)
         : undefined;
+    let fallbackProxyConfigPromise;
 
-    const getProxyUrl = async () => (proxyConfig ? proxyConfig.newUrl() : undefined);
+    const getProxyUrl = async (activeProxyConfig) => (activeProxyConfig ? activeProxyConfig.newUrl() : undefined);
+    const getFallbackProxyConfig = async () => {
+        if (proxyConfiguration) return null;
+        if (!fallbackProxyConfigPromise) {
+            fallbackProxyConfigPromise = Actor.createProxyConfiguration({ useApifyProxy: true });
+        }
+        return fallbackProxyConfigPromise;
+    };
 
-    const requestWithProxy = async (options) => {
-        const proxyUrl = await getProxyUrl();
+    const executeRequest = async (options, activeProxyConfig) => {
+        const proxyUrl = await getProxyUrl(activeProxyConfig);
         return gotScraping({
             ...options,
             proxyUrl,
@@ -422,6 +555,35 @@ async function main() {
             responseType: options.responseType || 'text',
             timeout: { request: 45000 },
         });
+    };
+
+    const requestWithRecovery = async (options, contextLabel) => {
+        let response;
+
+        try {
+            response = await executeRequest(options, proxyConfig);
+        } catch (error) {
+            log.warning(`${contextLabel} failed before response: ${error.message}`);
+        }
+
+        if (response && response.statusCode < 400 && !isBlockedBody(response.body)) {
+            return response;
+        }
+
+        const fallbackProxyConfig = await getFallbackProxyConfig();
+        if (!fallbackProxyConfig) {
+            if (response) return response;
+            throw new Error(`${contextLabel} failed without a response.`);
+        }
+
+        log.warning(`${contextLabel} was blocked or returned ${response?.statusCode ?? 'no response'}. Retrying with Apify Proxy fallback.`);
+
+        const fallbackResponse = await executeRequest(options, fallbackProxyConfig);
+        if (isBlockedBody(fallbackResponse.body)) {
+            log.warning(`${contextLabel} still returned a blocked access page after proxy fallback.`);
+        }
+
+        return fallbackResponse;
     };
 
     const startUrlValues = asArray(startUrls)
@@ -463,16 +625,16 @@ async function main() {
     async function createSession(url) {
         const cookieJar = new CookieJar();
 
-        const response = await requestWithProxy({
+        const response = await requestWithRecovery({
             url,
             cookieJar,
             headers: {
                 accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'accept-language': 'en-US,en;q=0.9',
             },
-        });
+        }, `Session bootstrap for ${url}`);
 
-        if (response.statusCode >= 400) {
+        if (response.statusCode >= 400 || isBlockedBody(response.body)) {
             throw new Error(`Session bootstrap failed (${response.statusCode}) for ${url}`);
         }
 
@@ -485,6 +647,7 @@ async function main() {
     async function fetchSearchPage(queryValue, offset, session) {
         const searchUrl = new URL('/search', BASE_URL);
         searchUrl.searchParams.set('q', queryValue);
+        if (offset) searchUrl.searchParams.set('offset', String(offset));
 
         const endpoint = new URL('/search', BASE_URL);
         endpoint.searchParams.set('q', queryValue);
@@ -501,7 +664,7 @@ async function main() {
             CSRFToken: session.csrfToken,
         });
 
-        const response = await requestWithProxy({
+        const response = await requestWithRecovery({
             method: 'POST',
             url: endpoint.toString(),
             cookieJar: session.cookieJar,
@@ -514,14 +677,31 @@ async function main() {
                 referer: searchUrl.toString(),
                 'accept-language': 'en-US,en;q=0.9',
             },
-        });
+        }, `Search API for "${queryValue}" offset=${offset}`);
 
-        if (response.statusCode >= 400) {
-            throw new Error(`Search API failed (${response.statusCode}) for query="${queryValue}" offset=${offset}`);
+        if (response.statusCode < 400 && !isBlockedBody(response.body)) {
+            const payload = parseResponseBody(response.body);
+            const componentHtml = getComponentHtml(payload, 'mntl-search-results__list_1');
+            if (componentHtml) return componentHtml;
+
+            log.warning(`Search API returned unexpected payload keys for "${queryValue}" offset=${offset}: ${getObjectKeys(payload).join(', ') || 'none'}`);
         }
 
-        const payload = parseResponseBody(response.body);
-        return getComponentHtml(payload, 'mntl-search-results__list_1');
+        log.warning(`Falling back to HTML search discovery for "${queryValue}" offset=${offset}.`);
+
+        const fallbackResponse = await requestWithRecovery({
+            url: searchUrl.toString(),
+            headers: {
+                accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'accept-language': 'en-US,en;q=0.9',
+            },
+        }, `Search HTML for "${queryValue}" offset=${offset}`);
+
+        if (fallbackResponse.statusCode >= 400 || isBlockedBody(fallbackResponse.body)) {
+            throw new Error(`Search discovery failed (${fallbackResponse.statusCode}) for query="${queryValue}" offset=${offset}`);
+        }
+
+        return typeof fallbackResponse.body === 'string' ? fallbackResponse.body : '';
     }
 
     for (const queryValue of searchQueries) {
@@ -544,12 +724,10 @@ async function main() {
                 break;
             }
 
-            let added = 0;
             for (const recipeUrl of recipeUrls) {
                 if (collectedRecipeUrls.size >= resultsWanted) break;
                 if (collectedRecipeUrls.has(recipeUrl)) continue;
                 collectedRecipeUrls.add(recipeUrl);
-                added++;
             }
 
             if (recipeUrls.length < SEARCH_PAGE_SIZE) {
@@ -597,7 +775,7 @@ async function main() {
             CSRFToken: session.csrfToken,
         });
 
-        const response = await requestWithProxy({
+        const response = await requestWithRecovery({
             method: 'POST',
             url: endpoint,
             cookieJar: session.cookieJar,
@@ -610,25 +788,54 @@ async function main() {
                 referer: recipeUrl,
                 'accept-language': 'en-US,en;q=0.9',
             },
-        });
+        }, `Recipe API for ${recipeUrl}`);
 
         return response;
+    }
+
+    async function fetchRecipeHtml(recipeUrl) {
+        const response = await requestWithRecovery({
+            url: recipeUrl,
+            headers: {
+                accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'accept-language': 'en-US,en;q=0.9',
+            },
+        }, `Recipe HTML for ${recipeUrl}`);
+
+        if (response.statusCode >= 400 || isBlockedBody(response.body)) {
+            throw new Error(`Recipe HTML failed (${response.statusCode}) for ${recipeUrl}`);
+        }
+
+        return typeof response.body === 'string' ? response.body : '';
     }
 
     async function fetchRecipePayload(recipeUrl) {
         let response = await postRecipePayload(recipeUrl, sharedRecipeSession);
 
         // Fallback session for blocked/expired shared-cookie requests.
-        if (response.statusCode >= 400) {
+        if (response.statusCode >= 400 || isBlockedBody(response.body)) {
             const fallbackSession = await createSession(recipeUrl);
             response = await postRecipePayload(recipeUrl, fallbackSession);
         }
 
-        if (response.statusCode >= 400) {
-            throw new Error(`Recipe API failed (${response.statusCode}) for ${recipeUrl}`);
+        if (response.statusCode < 400 && !isBlockedBody(response.body)) {
+            const payload = parseResponseBody(response.body);
+            if (hasRecipePayload(payload)) {
+                return { payload, source: 'component-api' };
+            }
+
+            log.warning(`Recipe API payload missing expected components for ${recipeUrl}. Keys: ${getObjectKeys(payload).join(', ') || 'none'}`);
         }
 
-        return parseResponseBody(response.body);
+        log.warning(`Falling back to recipe HTML JSON-LD extraction for ${recipeUrl}.`);
+        const html = await fetchRecipeHtml(recipeUrl);
+        const fallbackRecipe = extractRecipeFromJsonLd(recipeUrl, html);
+
+        if (!fallbackRecipe) {
+            throw new Error(`Recipe API failed (${response.statusCode}) and JSON-LD fallback was unavailable for ${recipeUrl}`);
+        }
+
+        return { payload: fallbackRecipe, source: 'jsonld-fallback' };
     }
 
     let saved = 0;
@@ -641,25 +848,33 @@ async function main() {
 
         const chunkResults = await Promise.all(chunk.map(async (canonical) => {
             try {
-                const payload = await fetchRecipePayload(canonical);
-                const extracted = extractRecipeData(canonical, payload);
+                const { payload, source } = await fetchRecipePayload(canonical);
+                const extracted = source === 'component-api'
+                    ? extractRecipeData(canonical, payload)
+                    : payload;
                 const cleaned = removeNullishDeep(extracted);
 
                 if (!cleaned || (!cleaned.name && !cleaned.ingredients && !cleaned.instructions)) {
-                    return null;
+                    return { ok: false, sample: null };
                 }
 
-                return cleaned;
+                return { ok: true, item: cleaned };
             } catch (error) {
-                failed++;
-                if (failureSamples.length < 3) {
-                    failureSamples.push(`${canonical} (${error.message})`);
-                }
-                return null;
+                return { ok: false, sample: `${canonical} (${error.message})` };
             }
         }));
 
-        pendingBatch.push(...chunkResults.filter(Boolean));
+        for (const result of chunkResults) {
+            if (result.ok) {
+                pendingBatch.push(result.item);
+                continue;
+            }
+
+            failed++;
+            if (result.sample && failureSamples.length < 3) {
+                failureSamples.push(result.sample);
+            }
+        }
 
         while (pendingBatch.length >= DATASET_BATCH_SIZE) {
             const batch = pendingBatch.splice(0, DATASET_BATCH_SIZE);

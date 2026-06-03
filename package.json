@@ -4,12 +4,21 @@
   "description": "Fast and efficient Allrecipes.com recipe scraper with JSON API support",
   "type": "module",
   "scripts": {
-    "start": "node src/main.js"
+    "start": "node src/main.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
   },
   "dependencies": {
-    "apify": "^3.6.0",
-    "crawlee": "^3.16.0",
+    "apify": "^3.7.2",
     "cheerio": "^1.2.0",
-    "got-scraping": "^4.2.1"
+    "crawlee": "^3.16.0",
+    "got-scraping": "^4.2.1",
+    "tough-cookie": "^5.1.2"
+  },
+  "devDependencies": {
+    "@apify/eslint-config": "^1.2.0",
+    "eslint": "^9.29.0",
+    "eslint-config-prettier": "^10.1.5",
+    "prettier": "^3.5.3"
   }
 }
