@@ -23,8 +23,6 @@ const RECIPE_COMPONENTS = [
 const SEARCH_PAGE_SIZE = 24;
 const RECIPE_CONCURRENCY = 8;
 const DATASET_BATCH_SIZE = 25;
-const DEFAULT_RESULTS_WANTED = 20;
-const DEFAULT_MAX_PAGES = 5;
 const MAX_RECOVERY_ATTEMPTS = 2;
 const HEADER_GENERATOR_OPTIONS = {
     browsers: [
@@ -82,6 +80,36 @@ async function loadInputJsonFallback() {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
         return {};
+    } catch {
+        return {};
+    }
+}
+
+async function loadSchemaInputFallback() {
+    try {
+        const raw = await readFile('.actor/input_schema.json', 'utf8');
+        const schema = JSON.parse(raw);
+        const properties = schema?.properties;
+
+        if (!properties || typeof properties !== 'object' || Array.isArray(properties)) {
+            return {};
+        }
+
+        const fallback = {};
+        for (const [key, config] of Object.entries(properties)) {
+            if (!config || typeof config !== 'object' || Array.isArray(config)) continue;
+
+            if (config.prefill !== undefined) {
+                fallback[key] = config.prefill;
+                continue;
+            }
+
+            if (config.default !== undefined) {
+                fallback[key] = config.default;
+            }
+        }
+
+        return fallback;
     } catch {
         return {};
     }
@@ -532,24 +560,29 @@ function extractRecipeData(recipeUrl, payload) {
 
 async function main() {
     const actorInput = (await Actor.getInput()) || {};
+    const schemaInput = await loadSchemaInputFallback();
+    const inputJsonFallback = await loadInputJsonFallback();
     const input = hasAnyInputFields(actorInput)
         ? actorInput
-        : await loadInputJsonFallback();
+        : {
+            ...inputJsonFallback,
+            ...schemaInput,
+        };
 
     if (!hasAnyInputFields(actorInput) && hasAnyInputFields(input)) {
-        log.info('No actor input detected. Using INPUT.json fallback.');
+        log.info('No actor input detected. Using input_schema.json prefill/default values with INPUT.json fallback.');
     }
 
     const {
         query,
         startUrls,
-        results_wanted: resultsWantedInput = DEFAULT_RESULTS_WANTED,
-        max_pages: maxPagesInput = DEFAULT_MAX_PAGES,
+        results_wanted: resultsWantedInput,
+        max_pages: maxPagesInput,
         proxyConfiguration,
     } = input;
 
-    const resultsWanted = Number.isFinite(Number(resultsWantedInput)) ? Math.max(1, Number(resultsWantedInput)) : DEFAULT_RESULTS_WANTED;
-    const maxPages = Number.isFinite(Number(maxPagesInput)) ? Math.max(1, Number(maxPagesInput)) : DEFAULT_MAX_PAGES;
+    const resultsWanted = Number.isFinite(Number(resultsWantedInput)) ? Math.max(1, Number(resultsWantedInput)) : 20;
+    const maxPages = Number.isFinite(Number(maxPagesInput)) ? Math.max(1, Number(maxPagesInput)) : 5;
 
     const proxyConfig = proxyConfiguration
         ? await Actor.createProxyConfiguration(proxyConfiguration)
