@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { Actor, log } from 'apify';
 import { load as cheerioLoad } from 'cheerio';
 import { Dataset } from 'crawlee';
-import { gotScraping } from 'got-scraping';
+import { Impit } from 'impit';
 import { CookieJar } from 'tough-cookie';
 
 const BASE_URL = 'https://www.allrecipes.com';
@@ -24,18 +24,7 @@ const SEARCH_PAGE_SIZE = 24;
 const RECIPE_CONCURRENCY = 8;
 const DATASET_BATCH_SIZE = 25;
 const MAX_RECOVERY_ATTEMPTS = 2;
-const HEADER_GENERATOR_OPTIONS = {
-    browsers: [
-        {
-            name: 'chrome',
-            minVersion: 136,
-            maxVersion: 137,
-        },
-    ],
-    devices: ['desktop'],
-    operatingSystems: ['windows'],
-    locales: ['en-US'],
-};
+const REQUEST_JITTER_MS = 300;
 const BLOCKED_BODY_PATTERNS = [
     /support@people\.inc/i,
     /reader experiencing an access issue/i,
@@ -569,10 +558,6 @@ async function main() {
             ...schemaInput,
         };
 
-    if (!hasAnyInputFields(actorInput) && hasAnyInputFields(input)) {
-        log.info('No actor input detected. Using input_schema.json prefill/default values with INPUT.json fallback.');
-    }
-
     const {
         query,
         startUrls,
@@ -598,16 +583,72 @@ async function main() {
         return fallbackProxyConfigPromise;
     };
 
+    const clientCache = new Map();
+
+    function getCachedClient(proxyUrl) {
+        const key = proxyUrl || '__direct__';
+        if (clientCache.has(key)) return clientCache.get(key);
+        const client = new Impit({
+            browser: 'chrome',
+            ignoreTlsErrors: true,
+            ...(proxyUrl && { proxyUrl }),
+        });
+        clientCache.set(key, client);
+        return client;
+    }
+
     const executeRequest = async (options, activeProxyConfig) => {
         const proxyUrl = await getProxyUrl(activeProxyConfig);
-        return gotScraping({
-            ...options,
-            proxyUrl,
-            throwHttpErrors: false,
-            responseType: options.responseType || 'text',
-            timeout: { request: 45000 },
-            headerGeneratorOptions: HEADER_GENERATOR_OPTIONS,
-        });
+        const client = getCachedClient(proxyUrl);
+
+        const fetchUrl = options.url || options;
+        const fetchOptions = {
+            method: options.method || 'GET',
+            headers: { ...(options.headers || {}) },
+        };
+
+        if (options.body) {
+            fetchOptions.body = options.body;
+        }
+
+        if (options.cookieJar) {
+            try {
+                const cookies = await options.cookieJar.getCookieString(fetchUrl);
+                if (cookies) {
+                    fetchOptions.headers.cookie = cookies;
+                }
+            } catch {
+                // Cookie read errors are non-fatal
+            }
+        }
+
+        fetchOptions.signal = AbortSignal.timeout(45000);
+
+        const response = await client.fetch(fetchUrl, fetchOptions);
+
+        if (options.cookieJar) {
+            try {
+                const setCookies = typeof response.headers.getSetCookie === 'function'
+                    ? response.headers.getSetCookie()
+                    : [];
+                for (const cookieStr of setCookies) {
+                    try {
+                        await options.cookieJar.setCookie(cookieStr, fetchUrl);
+                    } catch {
+                        // Skip invalid cookies
+                    }
+                }
+            } catch {
+                // Cookie storage errors are non-fatal
+            }
+        }
+
+        const body = await response.text();
+
+        return {
+            statusCode: response.status,
+            body,
+        };
     };
 
     const requestWithRecovery = async (options, contextLabel) => {
@@ -627,10 +668,10 @@ async function main() {
                     }
 
                     lastResponse = response;
-                    log.warning(`${contextLabel} attempt ${attempt}/${MAX_RECOVERY_ATTEMPTS} on route ${proxyIndex + 1}/${proxyChain.length} returned ${response.statusCode}${isBlockedBody(response.body) ? ' with blocked page' : ''}.`);
+                    log.debug(`${contextLabel} attempt ${attempt}/${MAX_RECOVERY_ATTEMPTS} on route ${proxyIndex + 1}/${proxyChain.length} returned ${response.statusCode}${isBlockedBody(response.body) ? ' with blocked page' : ''}.`);
                 } catch (error) {
                     lastError = error;
-                    log.warning(`${contextLabel} attempt ${attempt}/${MAX_RECOVERY_ATTEMPTS} on route ${proxyIndex + 1}/${proxyChain.length} failed: ${error.message}`);
+                    log.debug(`${contextLabel} attempt ${attempt}/${MAX_RECOVERY_ATTEMPTS} on route ${proxyIndex + 1}/${proxyChain.length} failed: ${error.message}`);
                 }
 
                 if (attempt < MAX_RECOVERY_ATTEMPTS) {
@@ -678,7 +719,7 @@ async function main() {
         throw new Error('Missing input. Provide `query`, `startUrls` with search URL, or direct recipe URLs.');
     }
 
-    log.info(`Input resolved. queries=${searchQueries.size}, directRecipes=${directRecipeUrls.size}, resultsWanted=${resultsWanted}, maxPages=${maxPages}`);
+    log.debug(`Input resolved. queries=${searchQueries.size}, directRecipes=${directRecipeUrls.size}, resultsWanted=${resultsWanted}, maxPages=${maxPages}`);
 
     const collectedRecipeUrls = new Set(directRecipeUrls);
 
@@ -694,7 +735,7 @@ async function main() {
         }, `Session bootstrap for ${url}`);
 
         if (response.statusCode >= 400 || isBlockedBody(response.body)) {
-            log.warning(`Session bootstrap failed (${response.statusCode}) for ${url}. Continuing without session-bound API access.`);
+            log.debug(`Session bootstrap failed (${response.statusCode}) for ${url}. Continuing without session-bound API access.`);
             return { cookieJar, csrfToken: '', unavailable: true };
         }
 
@@ -710,7 +751,7 @@ async function main() {
         if (offset) searchUrl.searchParams.set('offset', String(offset));
 
         if (session?.unavailable) {
-            log.warning(`Skipping search API for "${queryValue}" offset=${offset} because session bootstrap was unavailable.`);
+            log.debug(`Skipping search API for "${queryValue}" offset=${offset} because session bootstrap was unavailable.`);
             const fallbackResponse = await requestWithRecovery({
                 url: searchUrl.toString(),
                 headers: {
@@ -758,10 +799,10 @@ async function main() {
             const componentHtml = getComponentHtml(payload, 'mntl-search-results__list_1');
             if (componentHtml) return componentHtml;
 
-            log.warning(`Search API returned unexpected payload keys for "${queryValue}" offset=${offset}: ${getObjectKeys(payload).join(', ') || 'none'}`);
+            log.debug(`Search API returned unexpected payload keys for "${queryValue}" offset=${offset}: ${getObjectKeys(payload).join(', ') || 'none'}`);
         }
 
-        log.warning(`Falling back to HTML search discovery for "${queryValue}" offset=${offset}.`);
+        log.debug(`Falling back to HTML search discovery for "${queryValue}" offset=${offset}.`);
 
         const fallbackResponse = await requestWithRecovery({
             url: searchUrl.toString(),
@@ -809,16 +850,16 @@ async function main() {
                 }
             }
         } catch (error) {
-            log.warning(`Search discovery failed for query "${queryValue}": ${error.message}`);
+            log.debug(`Search discovery failed for query "${queryValue}": ${error.message}`);
         }
 
-        log.info(`Queued ${collectedRecipeUrls.size} recipe URLs so far for query "${queryValue}".`);
+        log.debug(`Queued ${collectedRecipeUrls.size} recipe URLs so far for query "${queryValue}".`);
     }
 
     const recipeQueue = [...collectedRecipeUrls].slice(0, resultsWanted);
 
     if (!recipeQueue.length) {
-        log.warning('No recipe URLs discovered from API search.');
+        log.debug('No recipe URLs discovered from API search.');
         return;
     }
 
@@ -832,7 +873,7 @@ async function main() {
     }
 
     if (!canonicalQueue.length) {
-        log.warning('No canonical recipe URLs available for processing.');
+        log.debug('No canonical recipe URLs available for processing.');
         return;
     }
 
@@ -902,10 +943,10 @@ async function main() {
                 return { payload, source: 'component-api' };
             }
 
-            log.warning(`Recipe API payload missing expected components for ${recipeUrl}. Keys: ${getObjectKeys(payload).join(', ') || 'none'}`);
+            log.debug(`Recipe API payload missing expected components for ${recipeUrl}. Keys: ${getObjectKeys(payload).join(', ') || 'none'}`);
         }
 
-        log.warning(`Falling back to recipe HTML JSON-LD extraction for ${recipeUrl}.`);
+        log.debug(`Falling back to recipe HTML JSON-LD extraction for ${recipeUrl}.`);
         const html = await fetchRecipeHtml(recipeUrl);
         const fallbackRecipe = extractRecipeFromJsonLd(recipeUrl, html);
 
@@ -922,9 +963,13 @@ async function main() {
     const pendingBatch = [];
 
     for (let offset = 0; offset < canonicalQueue.length; offset += RECIPE_CONCURRENCY) {
+        if (offset > 0) {
+            await delay(Math.random() * REQUEST_JITTER_MS);
+        }
         const chunk = canonicalQueue.slice(offset, offset + RECIPE_CONCURRENCY);
 
-        const chunkResults = await Promise.all(chunk.map(async (canonical) => {
+        const chunkResults = await Promise.all(chunk.map(async (canonical, i) => {
+            if (i > 0) await delay(Math.random() * 100);
             try {
                 const { payload, source } = await fetchRecipePayload(canonical);
                 const extracted = source === 'component-api'
