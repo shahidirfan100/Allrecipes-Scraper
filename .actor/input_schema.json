@@ -1,46 +1,48 @@
 {
-  "title": "Allrecipes Recipe Scraper",
-  "description": "Extract recipes from Allrecipes.com with ingredients, instructions, ratings, and nutritional information. Search by recipe name, ingredient, or meal type.",
+  "title": "Allrecipes Scraper",
+  "description": "Extract recipes from Allrecipes.com with ingredients, instructions, ratings, times, servings, and nutrition. Search by keyword or supply recipe, search, category, or gallery URLs.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "startUrls": {
-      "title": "Start URLs (Optional)",
+      "title": "Start URLs",
       "type": "array",
-      "description": "Array of Allrecipes URLs to scrape. If provided, this overrides the search query. Useful for scraping specific recipe categories or collections.",
-      "editor": "requestListSources",
-      "prefill": [{"url": "https://www.allrecipes.com/search?q=Chicken"}]
+      "description": "Allrecipes recipe, search, category, or gallery URLs. When supplied, these take precedence over the Search Query field. Recipe URLs are scraped directly; search URLs are paginated up to Maximum Pages.",
+      "editor": "requestListSources"
     },
     "query": {
       "title": "Search Query",
       "type": "string",
-      "description": "Recipe search term (e.g., 'Chicken Pasta', 'Chocolate Cake', 'Vegan Soup'). This will search Allrecipes for matching recipes.",
+      "description": "Recipe search term, such as chicken pasta, chocolate cake, or vegan soup. Used only when Start URLs is empty. If left blank, the scraper uses chicken.",
       "editor": "textfield",
-      "prefill": "Chicken",
-      "example": "Chicken"
+      "default": "chicken",
+      "prefill": "chicken",
+      "example": "chicken pasta"
     },
     "results_wanted": {
       "title": "Maximum Recipes",
       "type": "integer",
-      "description": "Maximum number of recipes to extract. Set higher for comprehensive results.",
+      "description": "Maximum number of recipes to save. The scraper stops after saving this many recipes.",
       "default": 20,
-      "prefill": 20,
+      "minimum": 1,
+      "maximum": 10000,
       "editor": "number",
       "example": 50
     },
     "max_pages": {
-      "title": "Maximum Pages to Crawl",
+      "title": "Maximum Pages per Search",
       "type": "integer",
-      "description": "Limits the number of search result pages to process. Helps control scraping time and resource usage.",
+      "description": "Maximum search-result pages to read for each query or search URL. Each page contains about 24 recipes.",
       "default": 5,
-      "prefill": 5,
+      "minimum": 1,
+      "maximum": 100,
       "editor": "number",
       "example": 10
     },
     "proxyConfiguration": {
       "title": "Proxy Configuration",
       "type": "object",
-      "description": "Configure proxy settings to avoid rate limiting. Residential proxies recommended for best results.",
+      "description": "Optional proxy settings. The scraper retries short-term page errors without a proxy. Configure a proxy only if your network is repeatedly blocked.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": false
