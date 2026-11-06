@@ -12,9 +12,12 @@ import { ResilientHttpClient } from './http.js';
 
 const BASE_URL = 'https://www.allrecipes.com';
 const SEARCH_PAGE_SIZE = 24;
-const RECIPE_CONCURRENCY = 5;
+const RECIPE_CONCURRENCY = 3;
+const PROXY_RECIPE_CONCURRENCY = 6;
 const DATASET_BATCH_SIZE = 25;
 const MAX_GALLERY_EXPANSIONS = 3;
+const RECIPE_RETRY_DELAY_MS = 5000;
+const DISCOVERY_RETRY_DELAY_MS = 15000;
 const DEFAULT_QUERY = 'chicken';
 const DEFAULT_RESULTS = 20;
 const DEFAULT_MAX_PAGES = 5;
@@ -48,6 +51,12 @@ function toBoundedInt(value, fallback, minimum, maximum) {
     const number = Number(value);
     if (!Number.isFinite(number)) return fallback;
     return Math.min(Math.max(Math.trunc(number), minimum), maximum);
+}
+
+function wait(ms) {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
 }
 
 function asUrl(value) {
@@ -126,7 +135,7 @@ async function fetchSearchPage(client, query, offset) {
     let htmlSession;
 
     try {
-        const response = await client.request(searchUrl, { isValidBody: isValidSearchBody });
+        const response = await client.request(searchUrl, { isValidBody: isValidSearchBody, maxAttempts: 3 });
         htmlSession = response.session;
         const links = extractSearchLinks(response.body);
         if (links.recipeUrls.length || links.noResults) {
@@ -204,6 +213,7 @@ async function fetchRecipe(client, recipeUrl) {
     try {
         const response = await client.request(recipeUrl, {
             isValidBody: isValidRecipeBody,
+            maxAttempts: 3,
         });
 
         htmlSession = response.session;
@@ -251,7 +261,11 @@ async function discoverRecipes(client, { queries, directRecipeUrls, listingUrls,
                 for (const url of result.galleryUrls) galleryUrls.add(url);
 
                 if (result.noResults || result.recipeUrls.length === 0) break;
-                if (result.recipeUrls.length < SEARCH_PAGE_SIZE) break;
+
+                // A short page can still have a next page, so trust pagination markup first.
+                const hasNextPage = result.hasNextPage === true
+                    || (result.hasNextPage !== false && result.recipeUrls.length >= SEARCH_PAGE_SIZE);
+                if (!hasNextPage) break;
             } catch (error) {
                 runStats.searchFailures += 1;
                 log.warning(`Search failed for "${query}" page ${page + 1}: ${error.message}`);
@@ -293,19 +307,20 @@ async function discoverRecipes(client, { queries, directRecipeUrls, listingUrls,
         }
     }
 
-    return [...recipeUrls].slice(0, discoveryTarget);
+    // Keep every direct URL: if some fail, the later ones are still valid fallbacks.
+    return [...recipeUrls];
 }
 
-async function processRecipes(client, recipeUrls, resultsWanted) {
+async function runRecipePass(client, recipeUrls, resultsWanted, alreadySaved, concurrency) {
     let saved = 0;
-    let failed = 0;
-    const failureSamples = [];
+    const failures = [];
+    const savedUrls = [];
     let pendingBatch = [];
 
-    for (let offset = 0; offset < recipeUrls.length; offset += RECIPE_CONCURRENCY) {
-        if (saved >= resultsWanted || saved + pendingBatch.length >= resultsWanted) break;
+    for (let offset = 0; offset < recipeUrls.length; offset += concurrency) {
+        if (alreadySaved + saved + pendingBatch.length >= resultsWanted) break;
 
-        const chunk = recipeUrls.slice(offset, offset + RECIPE_CONCURRENCY);
+        const chunk = recipeUrls.slice(offset, offset + concurrency);
         const chunkResults = await Promise.all(chunk.map(async (recipeUrl) => {
             try {
                 const result = await fetchRecipe(client, recipeUrl);
@@ -320,13 +335,15 @@ async function processRecipes(client, recipeUrls, resultsWanted) {
 
         for (const result of chunkResults) {
             if (result.recipe) {
-                if (saved + pendingBatch.length >= resultsWanted) continue;
+                savedUrls.push(result.recipeUrl);
+                if (alreadySaved + saved + pendingBatch.length >= resultsWanted) continue;
                 pendingBatch.push(result.recipe);
             } else if (result.error) {
-                failed += 1;
-                if (failureSamples.length < 3) {
-                    failureSamples.push(`${result.recipeUrl} (${result.error.message})`);
-                }
+                failures.push({
+                    url: result.recipeUrl,
+                    message: result.error.message,
+                    retryable: !result.error.notFound,
+                });
             }
         }
 
@@ -337,21 +354,51 @@ async function processRecipes(client, recipeUrls, resultsWanted) {
             saved += batch.length;
         }
 
-        if (saved >= resultsWanted) break;
+        if (alreadySaved + saved >= resultsWanted) break;
     }
 
-    if (pendingBatch.length && saved < resultsWanted) {
-        const batch = pendingBatch.slice(0, resultsWanted - saved);
+    if (pendingBatch.length && alreadySaved + saved < resultsWanted) {
+        const batch = pendingBatch.slice(0, resultsWanted - alreadySaved - saved);
         await Dataset.pushData(batch);
         saved += batch.length;
     }
 
-    if (failed > 0) {
-        const samples = failureSamples.length ? ` Samples: ${failureSamples.join(' | ')}` : '';
-        log.warning(`Failed ${failed} recipe requests.${samples}`);
+    return { saved, failures, savedUrls };
+}
+
+async function processRecipes(client, recipeUrls, resultsWanted, concurrency) {
+    let saved = 0;
+    let remaining = [...recipeUrls];
+    const failedByUrl = new Map();
+
+    // Second pass gives transient blocks and rate limits a chance to clear.
+    for (let pass = 0; pass < 2 && saved < resultsWanted && remaining.length; pass += 1) {
+        if (pass > 0) {
+            const circuitWait = typeof client.circuitRemainingMs === 'function' ? client.circuitRemainingMs() : 0;
+            const delayMs = Math.max(RECIPE_RETRY_DELAY_MS, circuitWait + 500) + Math.floor(Math.random() * 2000);
+            log.info(`Retrying ${remaining.length} failed recipes after ${Math.round(delayMs / 1000)}s.`);
+            await wait(delayMs);
+        }
+
+        const result = await runRecipePass(client, remaining, resultsWanted, saved, concurrency);
+        saved += result.saved;
+
+        for (const failure of result.failures) failedByUrl.set(failure.url, failure);
+        for (const url of result.savedUrls) failedByUrl.delete(url);
+
+        remaining = [...failedByUrl.values()]
+            .filter((failure) => failure.retryable)
+            .map((failure) => failure.url);
     }
 
-    return { saved, failed };
+    if (failedByUrl.size) {
+        const samples = [...failedByUrl.values()]
+            .slice(0, 3)
+            .map((failure) => `${failure.url} (${failure.message})`);
+        log.warning(`Failed ${failedByUrl.size} recipe requests after retry. Samples: ${samples.join(' | ')}`);
+    }
+
+    return { saved, failed: failedByUrl.size };
 }
 
 await Actor.main(async () => {
@@ -408,7 +455,7 @@ await Actor.main(async () => {
     log.info(`Starting run | mode=${startUrls.length ? 'startUrls' : 'query'} | queries=${[...queries].join(', ') || 'none'} | directRecipes=${directRecipeUrls.size} | listings=${listingUrls.length} | target=${resultsWanted} | maxPages=${maxPages} | proxy=${proxyConfiguration ? 'enabled' : 'disabled'}`);
 
     const client = new ResilientHttpClient({ proxyConfiguration });
-    const recipeUrls = await discoverRecipes(client, {
+    let recipeUrls = await discoverRecipes(client, {
         queries: [...queries],
         directRecipeUrls: [...directRecipeUrls],
         listingUrls,
@@ -416,27 +463,51 @@ await Actor.main(async () => {
         maxPages,
     });
 
+    if (!recipeUrls.length && runStats.searchFailures > 0) {
+        const circuitWait = client.circuitRemainingMs();
+        const delayMs = Math.max(DISCOVERY_RETRY_DELAY_MS, circuitWait + 500) + Math.floor(Math.random() * 3000);
+        log.warning(`Discovery returned nothing after request retries. Retrying once in ${Math.round(delayMs / 1000)}s.`);
+        await wait(delayMs);
+        recipeUrls = await discoverRecipes(client, {
+            queries: [...queries],
+            directRecipeUrls: [...directRecipeUrls],
+            listingUrls,
+            resultsWanted,
+            maxPages,
+        });
+    }
+
     if (!recipeUrls.length) {
         if (runStats.searchFailures > 0) {
-            throw new Error(`No recipe URLs were discovered and ${runStats.searchFailures} search requests failed. Check logs for the failing profile and response details.`);
+            const proxyHint = proxyConfiguration
+                ? ''
+                : ' Enable proxyConfiguration with Apify Proxy if this repeats from a datacenter network.';
+            throw new Error(`No recipe URLs were discovered and ${runStats.searchFailures} search requests failed.${proxyHint} Check logs for the failing profile and response details.`);
         }
 
         log.warning('No recipes matched the supplied search. The run completed without dataset items.');
         return;
     }
 
-    log.info(`Discovered ${recipeUrls.length} recipe URLs. Extracting with concurrency ${RECIPE_CONCURRENCY}.`);
+    const recipeConcurrency = proxyConfiguration ? PROXY_RECIPE_CONCURRENCY : RECIPE_CONCURRENCY;
+    log.info(`Discovered ${recipeUrls.length} recipe URLs. Extracting with concurrency ${recipeConcurrency}.`);
 
-    const { saved, failed } = await processRecipes(client, recipeUrls, resultsWanted);
+    const { saved, failed } = await processRecipes(client, recipeUrls, resultsWanted, recipeConcurrency);
     const stats = client.getStats();
 
     if (saved === 0) {
-        throw new Error(`No recipes could be extracted from ${recipeUrls.length} discovered URLs (${failed} failed). The site may be blocking requests or the page structure may have changed.`);
+        const proxyHint = proxyConfiguration
+            ? ''
+            : ' Enable proxyConfiguration with Apify Proxy if this repeats from a datacenter network.';
+        throw new Error(`No recipes could be extracted from ${recipeUrls.length} discovered URLs (${failed} failed).${proxyHint} The site may be blocking requests or the page structure may have changed.`);
     }
 
     if (saved < resultsWanted) {
         log.warning(`Only ${saved} of ${resultsWanted} requested recipes were saved (${recipeUrls.length} URLs discovered, ${failed} failed).`);
     }
 
-    log.info(`Finished | saved=${saved} | target=${resultsWanted} | failed=${failed} | searchPages=${runStats.searchPages} | searchFailures=${runStats.searchFailures} | recipeFailures=${runStats.recipeFailures} | componentFallbacks=${runStats.componentFallbacks} | requests=${stats.requests} | profiles=${stats.profilesUsed || 'none'}`);
+    let proxyState = 'off';
+    if (stats.proxyDisabled) proxyState = 'fallback-direct';
+    else if (proxyConfiguration) proxyState = 'enabled';
+    log.info(`Finished | saved=${saved} | target=${resultsWanted} | failed=${failed} | searchPages=${runStats.searchPages} | searchFailures=${runStats.searchFailures} | recipeFailures=${runStats.recipeFailures} | componentFallbacks=${runStats.componentFallbacks} | proxy=${proxyState} | requests=${stats.requests} | profiles=${stats.profilesUsed || 'none'}`);
 });

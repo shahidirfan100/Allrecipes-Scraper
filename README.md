@@ -24,7 +24,7 @@ Use it to build a recipe database, compare dishes, research food trends, populat
 | Social proof | Rating value, rating count, review count, user photo count |
 | Ingredients | Display lines plus parsed quantity, unit, and ingredient name |
 | Instructions | Ordered step text and step images when available |
-| Nutrition | Calories, fat, carbs, protein, daily value rows, servings per recipe |
+| Nutrition | Calories, fat, carbs, protein, sugar, full label amounts, daily value rows, servings per recipe |
 
 Some pages do not publish every field. The Actor omits fields that have no source value instead of saving empty placeholders.
 
@@ -46,7 +46,7 @@ When **Start URLs** contains at least one valid Allrecipes URL, the Actor uses t
 | `query` | String | No | `chicken` | Search term used when `startUrls` is empty. |
 | `results_wanted` | Integer | No | `20` | Maximum number of recipes to save. Range: 1 to 10,000. |
 | `max_pages` | Integer | No | `5` | Maximum search result pages to read per query or search URL. Range: 1 to 100. |
-| `proxyConfiguration` | Object | No | Apify proxy disabled | Optional proxy settings. Use only if your network is repeatedly blocked. |
+| `proxyConfiguration` | Object | No | Disabled | Proxy settings. It is off by default because the Actor works from Apify's network without a proxy. Enable Apify Residential Proxy if repeated runs return block pages. Residential usage is billed by Apify. |
 
 Search pages usually contain about 24 recipes. A run can discover more URLs than the result limit and stops extracting when the limit is reached. If fewer recipes are available than requested, the Actor saves what it found and logs a warning.
 
@@ -77,7 +77,7 @@ Search pages usually contain about 24 recipes. A run can discover more URLs than
 | `instructions` | Array | Ordered instruction text. |
 | `instructionImages` | Array | Step image URLs when the page includes them. |
 | `details` | Object | Labeled page values such as Prep Time, Cook Time, and Servings. |
-| `nutrition` | Object | `summary`, `dailyValues`, and `extra` nutrition data. |
+| `nutrition` | Object | `summary`, `dailyValues`, `values`, and `extra` nutrition data. `values` keeps every full-label amount, including rows without a % Daily Value such as Total Sugars and Added Sugars. |
 | `scrapedAt` | String | ISO timestamp for when the recipe was collected. |
 
 ## Usage Examples
@@ -124,7 +124,7 @@ Use an Allrecipes search URL and read up to two result pages:
 
 ### Run with a proxy
 
-Enable an Apify proxy if your network is repeatedly blocked:
+Proxy is off by default. Enable Apify Residential Proxy if runs from your network return block pages:
 
 ```json
 {
@@ -132,7 +132,8 @@ Enable an Apify proxy if your network is repeatedly blocked:
   "results_wanted": 50,
   "max_pages": 5,
   "proxyConfiguration": {
-    "useApifyProxy": true
+    "useApifyProxy": true,
+    "apifyProxyGroups": ["RESIDENTIAL"]
   }
 }
 ```
@@ -203,6 +204,17 @@ Enable an Apify proxy if your network is repeatedly blocked:
       "Total Carbohydrate 25g": "9%",
       "Protein 42g": "84%"
     },
+    "values": {
+      "Calories": "471",
+      "Total Fat": "25g",
+      "Saturated Fat": "9g",
+      "Cholesterol": "187mg",
+      "Sodium": "840mg",
+      "Total Carbohydrate": "25g",
+      "Dietary Fiber": "1g",
+      "Total Sugars": "4g",
+      "Protein": "42g"
+    },
     "extra": {
       "servingsPerRecipe": "4"
     }
@@ -256,7 +268,11 @@ The Actor only saves values that appear on the page. A recipe may not list a tes
 
 ### What happens if Allrecipes changes its pages?
 
-The Actor checks more than one part of a recipe page and retries temporary page errors. If a run returns no recipes, check the run log and report the issue through the Issues tab so the extraction can be updated.
+The Actor retries temporary errors, rotates request identities, and falls back to a second page source when the main page does not contain complete recipe data. If a run still returns no recipes, check the run log and report the issue through the Issues tab so the extraction can be updated.
+
+### Does the output include Total Sugars and Added Sugars?
+
+Yes, when the recipe page publishes them. These rows have no % Daily Value, so they are saved in `nutrition.values` as amounts (for example `"Total Sugars": "12g"`). `nutrition.dailyValues` keeps rows that do have a percentage. Added Sugars appears only on pages that list it.
 
 ### Is it legal to scrape Allrecipes?
 

@@ -42,7 +42,7 @@
     "proxyConfiguration": {
       "title": "Proxy Configuration",
       "type": "object",
-      "description": "Optional proxy settings. The scraper retries short-term page errors without a proxy. Configure a proxy only if your network is repeatedly blocked.",
+      "description": "Proxy settings. Disabled by default because the Actor works from Apify's network without one. Enable Apify Residential Proxy if repeated runs return block pages. Residential proxy usage is billed by Apify.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": false

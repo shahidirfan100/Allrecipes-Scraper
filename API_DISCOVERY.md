@@ -1,37 +1,65 @@
-# Allrecipes Discovery Notes
+# Allrecipes discovery notes
 
-Last verified: 2026-10-23
+Last verified: 2026-11-06
 
-This document records what the scraper was built against after starting discovery from scratch. It is a technical record, not legal advice. Allrecipes is operated by People Inc., and its terms of service restrict automated collection. The scraper is intended for legitimate collection of public recipe data; users are responsible for compliance.
+This file records what the scraper was rebuilt against. It is a technical record, not legal advice. Allrecipes is operated by People Inc., and its terms restrict automated collection. Use this scraper only for public recipe data you are allowed to collect.
 
 ## Environment
 
 | Item | Value |
 |------|-------|
-| Node.js | 24.13.0 |
-| npm | 11.6.2 |
-| impit at verification | 0.14.7 |
+| Local Node.js | 26.13.0 |
+| Container Node.js | 22 |
+| impit | 0.14.8 |
 | apify SDK | 3.7.2 |
+| cheerio | 1.2.0 |
 
-## Primary decision
+## Selected sources
 
-Use the normal recipe page HTML as the primary source and the deferred component endpoint as a fallback. Search results come from the search page HTML, with the search component endpoint as a fallback.
+Recipe:
 
-Reason: the recipe HTML contains the complete JSON-LD block plus server-rendered ingredient and step markup. The deferred component endpoint still returns JSON-LD, but two of the old component keys no longer return usable content. A scraper that depends only on those keys fails.
+| Order | Source | Use |
+|-------|--------|-----|
+| 1 | Recipe page HTML | Full JSON-LD block plus server-rendered ingredients, steps, details, and nutrition |
+| 2 | Deferred component endpoint | Fallback when the recipe HTML is incomplete or changes |
 
-## Request behavior
+Search:
 
-| Test | Result |
-|------|--------|
-| Plain Node `fetch` with a Node user agent | HTTP 402 block page from People Inc. |
-| impit with a supported browser profile | HTTP 200, normal Allrecipes page |
-| `m.allrecipes.com` | Connection failure |
-| `api.allrecipes.com` | Connection failure |
-| `/api/` and `/graphql` | HTTP 404 |
-| Recipe page HTML size | About 523 KB |
-| Search page HTML size | About 382 KB |
+| Order | Source | Use |
+|-------|--------|-----|
+| 1 | Search page HTML | 24 unique recipe links per page, offset pagination, next-page link |
+| 2 | Search component endpoint | Fallback when the search HTML returns no usable links |
 
-No mobile API was found. The public site and its deferred component endpoint are the usable surfaces.
+A plain HTTP client without browser fingerprinting gets a 402 block page from People Inc. impit profiles return the normal site. No mobile app API was found.
+
+## Sources checked
+
+Live probes on 2026-11-06:
+
+| Target | Result |
+|--------|--------|
+| `https://www.allrecipes.com/search?q=chicken` | 200, about 379 KB, 24 unique recipe links |
+| `https://www.allrecipes.com/recipe/8858/cream-of-chicken-breasts/` | 200, about 519 KB, complete JSON-LD and recipe markup |
+| `https://m.allrecipes.com/` | DNS failure |
+| `https://mobile.allrecipes.com/` | DNS failure |
+| `https://api.allrecipes.com/` | DNS failure |
+| `https://api.allrecipes.com/v1/recipes` | DNS failure |
+| `https://www.allrecipes.com/api/` | 301 to `/api` |
+| `https://www.allrecipes.com/api/v1/recipes` | 404 HTML page |
+| `https://www.allrecipes.com/graphql` | 404 HTML page |
+| `https://www.allrecipes.com/search/api?q=chicken` | 404 HTML page |
+| `https://www.allrecipes.com/recipe/.../.json` | 404 HTML page |
+
+Public repository survey:
+
+| Repository | Approach | Result |
+|------------|----------|--------|
+| `turbotoad12/py-allrecipes` (2025) | `requests` plus BeautifulSoup on search and recipe HTML | Uses the same HTML surfaces |
+| `remaudcorentin-dev/python-allrecipes` (2024) | urllib plus BeautifulSoup | Uses the same HTML surfaces |
+| `dtrungtin/actor-allrecipes-scraper` (2024) | Apify CheerioCrawler | Uses search cards and recipe selectors |
+| `VastHornet/allrecipes-*` (2026) | README-only repositories | No implementation to reuse |
+
+No repository documented a mobile, GraphQL, or JSON search endpoint that works today. The usable source remains the public HTML and its deferred component endpoint.
 
 ## Search pages
 
@@ -45,26 +73,44 @@ Observed behavior:
 
 | Item | Value |
 |------|-------|
-| Page size | 24 unique recipe links |
+| Unique recipe links per page | 24 on most queries, sometimes fewer when a result is duplicated |
 | Recipe link pattern | `/recipe/<id>/<slug>/` |
-| Card selector | `a.mntl-card-list-card--extendable` |
-| Pagination | `offset` increments by 24 |
-| Last page signal | Fewer than 24 unique recipe links |
-| No-results signal | Page text contains "no results", "0 results", or "couldn't find" |
+| Pagination control | `#mntl-pagination_1-0`, five-page window |
+| Next-page signal | An `a` with `aria-label` containing "next page", or `.mntl-pagination__item--next a` |
+| Page size as a stop signal | Not reliable: page 1 for `vegan soup` had 23 unique links and page 2 still existed |
+| No-results signal | HTTP 404, or page text containing "no results", "0 results", or "couldn't find" |
+| Overlap between pages | Possible, so deduplicate by canonical URL |
 
-The search page also contains gallery links. Galleries can expose more recipe links, so the scraper treats them as a secondary discovery source with a small expansion limit.
+The scraper reads the next-page link first and falls back to the old page-size rule only when the pagination markup is absent. `max_pages` still caps the loop.
+
+Search pages also contain gallery links. Galleries are a secondary discovery source with a small expansion limit.
+
+## Search component endpoint
+
+Working request:
+
+```text
+POST https://www.allrecipes.com/search?q=<query>&offset=<offset>&url=<encoded searchUrl>
+```
+
+Component keys:
+
+```text
+mntl-search-results__list_1,mntl-pagination_1
+```
+
+The response was 108,337 bytes of JSON. Keys matched the requested names, and the payload contained recipe links. The same link extractor runs on the HTML strings inside the JSON.
 
 ## Recipe pages
 
 The recipe page contains:
 
-- A `script[type="application/ld+json"]` block.
-- The JSON-LD `@type` value is an array, for example `["Recipe"]`, not a string.
-- Server-rendered ingredient markup.
-- Server-rendered instruction markup.
-- Rating, review count, photo count, times, servings, category, cuisine, and nutrition blocks.
+- One `script[type="application/ld+json"]` block with `@type: ["Recipe"]` or `@type: "Recipe"`.
+- Server-rendered ingredient markup under `.mm-recipes-structured-ingredients__list-item`.
+- Server-rendered instruction markup under `.mm-recipes-steps__content` and `.mntl-sc-block-group--LI`.
+- Details, rating, review count, photo count, category, cuisine, breadcrumbs, and nutrition blocks.
 
-The extractor accepts both string and array `@type` values. It also merges supporting JSON-LD nodes, including breadcrumbs, when the recipe node does not carry all fields.
+The extractor accepts string and array `@type` values and merges supporting JSON-LD nodes, including `BreadcrumbList`, when the recipe node does not carry every field.
 
 ## Deferred component endpoint
 
@@ -89,116 +135,96 @@ Body:
 globeDeferVersion=2&cr=<keys>&loaded_cr=&cis=1&force_cis=&pv=undefined&CSRFToken=<token>
 ```
 
-The endpoint returned HTTP 200 without a CSRF token or session cookie during verification. The scraper still reads `CSRFToken` from its cookie jar when one exists, so a future token requirement does not require a code change.
+The response was 50,601 bytes of JSON. The page exposes `window.Mntl.csrfInit('<token>', true)`, and the same value is set as the `CSRFToken` cookie. On 2026-11-06 the endpoint returned usable JSON with the inline token, with the cookie token, and with no token at all. The scraper still sends the token when it can find one, so a future token requirement does not need a code change.
 
-### Component key findings
+Component key findings:
 
 | Key | Status |
 |-----|--------|
-| `allrecipes-schema_1` | Returns the full JSON-LD block, about 17.8 KB |
-| `mm-recipes-structured-ingredients_1` | Empty or error banner |
-| `mm-recipes-steps_1` | Empty or error banner |
-| `mm-recipes-steps__content_1` | Still returns step markup |
+| `allrecipes-schema_1` | Returns the full JSON-LD block, about 14.5 KB |
+| `mm-recipes-structured-ingredients_1` | Not used; the schema block carries the ingredients |
+| `mm-recipes-steps_1` | Not used; the schema block carries the steps |
+| `mm-recipes-steps__content_1` | Returns step markup when requested |
 | `mm-recipes-details_1` | Works |
 | `mm-recipes-nutrition-facts-summary_1` | Works |
 | `mm-recipes-nutrition-facts-label_1` | Works |
+| `article-preheading_1` | Works |
 | `article-header--recipe_1` | Works |
 | `mntl-article-meta-dynamic_1` | Works |
-| Review bar rating and count keys | Work |
+| Review bar rating, rating count, comment count, photo count | Work |
 
-The fallback key list used by the scraper:
+Fallback key list used by the scraper:
 
 ```text
 allrecipes-schema_1,article-preheading_1,article-header--recipe_1,mntl-article-meta-dynamic_1,mm-recipes-review-bar__rating_1,mm-recipes-review-bar__rating-count_1,mm-recipes-review-bar__comment-count_1,recipe-review-bar__photo-count_1,mm-recipes-details_1,mm-recipes-nutrition-facts-summary_1,mm-recipes-nutrition-facts-label_1
 ```
 
-This payload produced the following in a live check:
-
-| Field | Result |
-|-------|--------|
-| Name | Chicken Parmesan |
-| Author | John Mitzewich |
-| Ingredients | 12 |
-| Instructions | 7 |
-| Rating | 4.9 from 5194 ratings |
-| Review count | 3788 |
-| Nutrition | Summary, daily values, extra |
-
-Ingredients and instructions come from the JSON-LD inside `allrecipes-schema_1`, not from the two empty component keys.
-
-## Search component fallback
-
-Working request:
-
-```text
-POST https://www.allrecipes.com/search?q=<query>&offset=<offset>&url=<encoded searchUrl>
-```
-
-Component keys:
-
-```text
-mntl-search-results__list_1,mntl-pagination_1
-```
-
-The response is about 108 KB and contains recipe links. The extractor reads HTML strings from keys matching `search-results`, `pagination`, or `card-list`, then applies the same link extraction as the search page. Duplicate links across cards are removed.
-
 ## Browser profile matrix
 
-Tested with impit 0.14.2 and 0.14.7. A profile is listed as working only when the recipe or search request returned a normal page.
+Tested with impit 0.14.8 on 2026-11-06 against the chicken search page and the cream of chicken recipe page. Each profile made four requests: two rounds over both pages, a fresh client per request, and a 0.9s gap between requests. A pass means HTTP 200, the expected markup, and no block markers. Times are milliseconds.
 
-### Working
+| Profile | Passes | Avg | Max |
+|---------|--------|-----|-----|
+| `chrome151` | 4/4 | 568 | 694 |
+| `chrome142` | 4/4 | 530 | 609 |
+| `firefox158` | 4/4 | 606 | 886 |
+| `chrome110` | 4/4 | 520 | 572 |
+| `chrome100` | 4/4 | 520 | 592 |
+| `chrome116` | 4/4 | 542 | 579 |
+| `firefox144` | 4/4 | 552 | 671 |
+| `okhttp3` | 4/4 | 564 | 605 |
+| `chrome124` | 4/4 | 572 | 740 |
+| `ios18` | 4/4 | 590 | 676 |
+| `okhttp` | 4/4 | 587 | 773 |
+| `firefox` | 4/4 | 590 | 652 |
+| `chrome104` | 4/4 | 591 | 786 |
+| `chrome125` | 4/4 | 600 | 691 |
+| `okhttp5` | 4/4 | 605 | 862 |
+| `firefox128` | 4/4 | 617 | 774 |
+| `chrome131` | 4/4 | 628 | 903 |
+| `firefox133` | 4/4 | 669 | 1029 |
+| `chrome101` | 4/4 | 788 | 1500 |
+| `okhttp4` | 4/4 | 842 | 1500 |
+| `chrome` | 4/4 | 1201 | 2990 |
+| `firefox135` | 4/4 | 1319 | 2539 |
+| `chrome107` | 4/4 | 1388 | 3276 |
+| `chrome136` | 3/4 | 829 | 1708 |
+
+Only `chrome136` failed a request: one 403 on the recipe page. Every other profile passed all four.
+
+Rotation order:
 
 ```text
-chrome
-chrome124
-chrome125
-chrome131
-chrome136
-chrome142
-firefox
-firefox128
-firefox133
-firefox135
-firefox144
-okhttp
-okhttp3
-okhttp4
-okhttp5
+chrome151, chrome142, firefox158, chrome110, chrome100, chrome116,
+firefox144, okhttp3, chrome124, ios18, okhttp, firefox, chrome104,
+chrome125, okhttp5, firefox128, chrome131, firefox133, chrome101,
+okhttp4, chrome, firefox135, chrome107, chrome136
 ```
 
-The generic `chrome` profile resolved to a recent Chrome fingerprint during testing. The generic `firefox` profile returned one transient HTTP 403 on a recipe request and succeeded on retry, so it is kept behind more specific profiles in the rotation order.
+`chrome151` stays first after a 107-request cloud run with no block. `firefox158` is third because it carried a cloud run after three Chrome profiles were blocked. The rest follow pass rate, then measured latency, so older Chrome builds that still pass are not buried. `ios18` is inside the first ten as a mobile fallback. `chrome131` moves up after passing all four requests, and `chrome136` sits last after its 403.
 
-### Failing
+## Request headers
 
-```text
-chrome100
-chrome101
-chrome104
-chrome107
-chrome110
-chrome116
-ios18
-```
-
-The older Chrome profiles failed at connection setup. `ios18` failed TLS negotiation with `TLS AlertReceived` or "failed to connect to the server".
-
-The scraper's rotation order starts with generic `chrome`, then recent Chrome, recent Firefox, and okhttp profiles. It does not use the failing profiles.
+The scraper lets impit generate the profile headers. It does not set `user-agent`, `accept`, `accept-language`, `sec-ch-ua`, or `sec-fetch-*` by hand. The component endpoint gets only the headers the server expects: `origin`, `referer`, `x-requested-with`, and `content-type`.
 
 ## Resilience model
 
-The client keeps one impit client and cookie jar per browser profile.
+The client keeps one impit client and cookie jar per profile.
 
-- Each request tries up to four profiles.
-- A profile with more failures is tried later.
-- A profile is cooled down for five minutes after three failures.
-- HTTP 402, 403, 429, 451, and block-page bodies trigger rotation.
-- HTTP 5xx triggers rotation with a short backoff.
-- HTTP 404 and 410 are returned immediately as not found, without rotating profiles.
-- `Retry-After` is honored on 429, capped at ten seconds.
-- A soft block that returns HTTP 200 with an invalid body is treated as a failure.
+- A request tries up to ten profiles, ordered by recent failures and then by last success.
+- A profile with more failures moves later.
+- A blocked profile cools down for five minutes; a temporary response cools down for thirty seconds.
+- HTTP 402, 403, 429, 451, and known block-page bodies trigger a fresh cookie jar and a proxy rotation when a proxy is configured.
+- HTTP 5xx, timeouts, and network errors trigger rotation with a short backoff.
+- HTTP 404 and 410 return immediately as not found, without rotating profiles.
+- `Retry-After` is honored on 429, capped at thirty seconds.
+- A 200 response with an invalid body counts as a failure, which covers soft blocks and changed markup.
+- A failed logical request recycles the cookie jar and connection of every failed profile.
+- The inline CSRF token is captured from every successful page, not only from the cookie jar.
 - If a proxy is configured, a session gets a fresh proxy URL after repeated failures, up to two refreshes.
-- A proxy is never enabled automatically.
-- No secret, cookie, or proxy URL is logged.
+- If proxy requests fail repeatedly, the run falls back to direct connections instead of stopping.
+- A site-wide circuit opens after four failed logical requests and pauses new requests for fifteen seconds.
+- No cookie, token, proxy URL, or full response body is logged.
 
 ## Extraction contract
 
@@ -211,42 +237,46 @@ photoCount, ingredients, ingredientItems, instructions, instructionImages, detai
 nutrition, scrapedAt
 ```
 
-Fields with no source value are omitted. `ingredients` is an array of display strings. `ingredientItems` is a parallel array of objects with `quantity`, `unit`, `name`, and `text` when those parts can be parsed. `instructions` is an array of strings, and `instructionImages` is a parallel array that appears only when step images exist. `details` keeps the page's labeled values, such as Prep Time, Cook Time, Total Time, and Servings.
+Fields with no source value are omitted. `ingredients` is an array of display strings. `ingredientItems` is a parallel array with `quantity`, `unit`, `name`, and `text` when those parts can be parsed. `instructions` is an array of strings. `instructionImages` appears only when step images exist. `details` keeps the labeled page values. Nutrition has `summary` (headline values), `dailyValues` (percentage rows), `values` (every full-label amount, including rows without a percentage), and `extra` (servings per recipe and calories).
 
 ## Reproduction checks
 
-Run the actor locally with a search input:
+Local run with the default search input:
 
 ```json
 {
   "query": "chicken",
-  "results_wanted": 10,
-  "max_pages": 2
+  "results_wanted": 20,
+  "max_pages": 5
 }
 ```
 
-Expected log shape:
+Observed on 2026-11-06:
 
 ```text
-Search "chicken" page 1: 24 recipe links
-Saved 10/10 recipes
-Finished | saved=10 | failed=0
+Search "chicken": 2 pages, 44 recipe links discovered.
+Discovered 44 recipe URLs. Extracting with concurrency 3.
+Finished | saved=20 | target=20 | failed=0 | searchPages=2 | searchFailures=0 | recipeFailures=0 | componentFallbacks=0 | proxy=off | requests=23 | profiles=chrome151:23
 ```
 
-Run with a direct recipe URL and with a search URL to verify both start URL modes.
+A separate `vegan soup` run with `results_wanted` 50 and `max_pages` 3 read three pages and saved 50 recipes. Page 1 for that query had 23 unique links and page 2 still existed, which confirms that the pagination signal, not the page size, decides when to stop.
+
+A 20-result chicken run completed in about 25 seconds with no failed requests.
 
 ## Known limits
 
-- A recipe page that is removed returns 404 and is skipped.
-- Search pages can change their card markup. The extractor falls back to any `/recipe/` link when card selectors return nothing.
-- The deferred endpoint can change its component keys. The fallback list is centralized in `src/main.js`.
-- The site can change its block page. Block detection uses known status codes and body text markers in `src/extract.js`.
+- A removed recipe returns 404 and is skipped.
+- Search and recipe markup can change. The extractor keeps selector fallbacks and reads JSON-LD separately from the visible HTML.
+- The deferred endpoint can change its component keys. The key list is centralized in `src/main.js`.
+- The block page can change. Detection covers known status codes and body markers in `src/extract.js`.
+- A query with no matches returns HTTP 404 for the search page. That is treated as an empty result, not a run failure.
 - The scraper does not claim to bypass anti-bot systems. If every profile is blocked, configure a proxy or wait for the cooldown.
+- Proxy is off by default. A 100-recipe run from the Apify cloud network completed without one, while local runs without proxy credentials also fall back to direct connections. Enable Apify Residential Proxy only if repeated runs return block pages.
 
 ## Removed approaches
 
-- Mobile host and mobile API discovery: no working host.
-- `/api/` and `/graphql`: 404.
-- Ingredient and step component keys as the primary source: empty responses.
-- Plain Node fetch: 402.
-- Old Chrome and iOS profiles: connection or TLS failures.
+- Mobile host and mobile API discovery: `m.`, `mobile.`, and `api.` hosts do not resolve.
+- `/api/`, `/api/v1/`, `/graphql`, and `/search/api`: no working JSON endpoint.
+- Plain Node `fetch` without a browser profile: 402 block page.
+- Ingredient and step component keys as the primary source: the schema block is more complete.
+- Old Chrome and iOS profiles as the first choice: they work as fallbacks but are slower or less consistent than current profiles.

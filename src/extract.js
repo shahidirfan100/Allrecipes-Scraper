@@ -23,8 +23,11 @@ const BLOCK_PATTERNS = [
     /contentlicensing@people\.inc/i,
     /reader experiencing an access issue/i,
     /cf-mitigated/i,
+    /cf-chl/i,
+    /challenge-platform/i,
     /verify you are (?:a )?human/i,
-    /enable javascript and cookies/i,
+    /enable javascript and cookies to continue/i,
+    /sorry, you have been blocked/i,
 ];
 
 const BLOCK_TITLE_PATTERNS = [
@@ -399,6 +402,7 @@ function extractSteps($, nodes) {
 function extractNutrition($, nodes) {
     const summary = {};
     const dailyValues = {};
+    const values = {};
     const extra = {};
 
     $('.mm-recipes-nutrition-facts-summary__table tr, .mm-recipes-nutrition-facts-summary table tr').each((_, row) => {
@@ -422,16 +426,26 @@ function extractNutrition($, nodes) {
             .get()
             .filter(Boolean);
 
-        if (cells.length >= 2) {
-            const first = cells[0].replace(/:$/, '');
-            const last = cells[cells.length - 1].replace(/:$/, '');
+        if (!cells.length) return;
 
-            if (/%$/.test(last)) {
-                dailyValues[first] = last;
-            } else if (/%$/.test(first)) {
-                dailyValues[last] = first;
+        const nameElement = $(row).find('.mm-recipes-nutrition-facts-label__nutrient-name').first();
+        if (nameElement.length) {
+            const label = cleanText(nameElement.text()).replace(/:$/, '');
+            const percent = cells.find((cell) => /^<?\d+(?:\.\d+)?\s*%$/.test(cell));
+            // Rows without a % Daily Value (Total Sugars, Added Sugars, trans fat, vitamin D)
+            // are a single cell holding the label and the amount.
+            const amount = cleanText(
+                cells
+                    .filter((cell) => cell !== percent)
+                    .join(' ')
+                    .replace(nameElement.text(), '')
+                    .replace(/^[:\s]+/, ''),
+            );
+
+            if (label && amount) {
+                values[label] = amount;
+                if (percent) dailyValues[`${label} ${amount}`] = percent;
             }
-
             return;
         }
 
@@ -440,16 +454,30 @@ function extractNutrition($, nodes) {
             if (/servings per recipe/i.test(line)) {
                 extra.servingsPerRecipe = cleanText(line.replace(/servings per recipe/i, ''));
             }
-            if (/calories/i.test(line) && !summary.Calories) {
+            if (/calories/i.test(line)) {
                 extra.calories = cleanText(line.replace(/calories/i, ''));
+                if (extra.calories) values.Calories = extra.calories;
             }
+            return;
+        }
+
+        const first = cells[0].replace(/:$/, '');
+        const last = cells[cells.length - 1].replace(/:$/, '');
+        if (/%$/.test(last)) {
+            dailyValues[first] = last;
+        } else if (/%$/.test(first)) {
+            dailyValues[last] = first;
         }
     });
 
-    if (!Object.keys(summary).length) {
-        const recipeNode = findNode(nodes, 'Recipe');
-        const nutrition = recipeNode?.nutrition;
-        if (nutrition && typeof nutrition === 'object') {
+    const nutrition = findNode(nodes, 'Recipe')?.nutrition;
+    if (nutrition && typeof nutrition === 'object') {
+        for (const [label, key] of NUTRITION_FIELDS) {
+            const value = decodeText(nutrition[key] || '');
+            if (value && !values[label]) values[label] = value;
+        }
+
+        if (!Object.keys(summary).length) {
             for (const [label, key] of NUTRITION_FIELDS) {
                 const value = decodeText(nutrition[key] || '');
                 if (value) summary[label] = value;
@@ -457,7 +485,7 @@ function extractNutrition($, nodes) {
         }
     }
 
-    return { summary, dailyValues, extra };
+    return { summary, dailyValues, values, extra };
 }
 
 function htmlReviewValues($) {
@@ -584,7 +612,7 @@ export function extractRecipeFromHtml(html, recipeUrl) {
 
 export function extractSearchLinks(html) {
     if (!html || typeof html !== 'string') {
-        return { recipeUrls: [], galleryUrls: [], noResults: false };
+        return { recipeUrls: [], galleryUrls: [], noResults: false, hasNextPage: null };
     }
 
     const $ = cheerioLoad(html);
@@ -641,12 +669,19 @@ export function extractSearchLinks(html) {
     const noResults = recipeUrls.length === 0
         && (bodyText.includes('no results') || bodyText.includes('0 results') || bodyText.includes("couldn't find"));
 
-    return { recipeUrls, galleryUrls, noResults };
+    // null means pagination markup was absent, so the caller falls back to page size.
+    const pagination = $('#mntl-pagination_1-0, .mntl-pagination').first();
+    const nextHref = pagination.length
+        ? pagination.find('a[rel="next"], a[aria-label*="next page" i], .mntl-pagination__item--next a').first().attr('href')
+        : null;
+    const hasNextPage = pagination.length && !noResults ? Boolean(nextHref) : null;
+
+    return { recipeUrls, galleryUrls, noResults, hasNextPage };
 }
 
 export function extractSearchLinksFromPayload(payload) {
     if (!payload || typeof payload !== 'object') {
-        return { recipeUrls: [], galleryUrls: [], noResults: false };
+        return { recipeUrls: [], galleryUrls: [], noResults: false, hasNextPage: null };
     }
 
     const html = Object.entries(payload)

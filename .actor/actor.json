@@ -3,7 +3,7 @@
   "name": "allrecipes-scraper",
   "title": "Allrecipes Scraper",
   "description": "Scrape Allrecipes recipes with ingredients, instructions, ratings, times, servings, and nutrition",
-  "version": "2.0",
+  "version": "2.1",
   "buildTag": "latest",
   "dockerfile": "../Dockerfile",
   "readme": "../README.md",

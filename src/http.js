@@ -5,24 +5,44 @@ import { CookieJar } from 'tough-cookie';
 
 import { isBlockedBody, isBlockedStatus, isTemporaryStatus } from './extract.js';
 
+// Order: live pass rate first, then latency. Matrix in API_DISCOVERY.md.
 const PROFILE_ORDER = [
-    'chrome',
+    'chrome151',
     'chrome142',
-    'chrome136',
+    'firefox158',
+    'chrome110',
+    'chrome100',
+    'chrome116',
     'firefox144',
-    'okhttp5',
-    'chrome131',
-    'firefox',
-    'okhttp4',
-    'chrome125',
+    'okhttp3',
     'chrome124',
+    'ios18',
+    'okhttp',
+    'firefox',
+    'chrome104',
+    'chrome125',
+    'okhttp5',
+    'firefox128',
+    'chrome131',
+    'firefox133',
+    'chrome101',
+    'okhttp4',
+    'chrome',
+    'firefox135',
+    'chrome107',
+    'chrome136',
 ];
 
-const REQUEST_TIMEOUT_MS = 25000;
-const MAX_PROFILE_ATTEMPTS = 4;
+const REQUEST_TIMEOUT_MS = 20000;
+const REQUEST_DEADLINE_MS = 120000;
+const MAX_PROFILE_ATTEMPTS = 10;
 const PROFILE_COOLDOWN_MS = 5 * 60 * 1000;
+const TRANSIENT_COOLDOWN_MS = 30 * 1000;
 const MAX_PROXY_REFRESHES = 2;
-const MAX_BACKOFF_MS = 2000;
+const MAX_BACKOFF_MS = 5000;
+const MAX_RETRY_AFTER_MS = 30000;
+const CIRCUIT_COOLDOWN_MS = 15000;
+const CIRCUIT_FAILURE_THRESHOLD = 4;
 
 function delay(ms) {
     return new Promise((resolve) => {
@@ -37,10 +57,18 @@ function jitter(ms) {
 function parseRetryAfter(value) {
     if (!value) return null;
     const seconds = Number(value);
-    if (Number.isFinite(seconds)) return Math.min(Math.max(seconds * 1000, 0), 10000);
+    if (Number.isFinite(seconds)) return Math.min(Math.max(seconds * 1000, 0), MAX_RETRY_AFTER_MS);
     const date = Date.parse(value);
-    if (Number.isFinite(date)) return Math.min(Math.max(date - Date.now(), 0), 10000);
+    if (Number.isFinite(date)) return Math.min(Math.max(date - Date.now(), 0), MAX_RETRY_AFTER_MS);
     return null;
+}
+
+function extractInlineCsrfToken(body) {
+    if (typeof body !== 'string' || !body) return '';
+    const initMatch = body.match(/csrfInit\(\s*['"]([^'"]+)['"]/i);
+    if (initMatch) return initMatch[1];
+    const metaMatch = body.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i);
+    return metaMatch ? metaMatch[1] : '';
 }
 
 export class ResilientHttpClient {
@@ -48,6 +76,9 @@ export class ResilientHttpClient {
         this.proxyConfiguration = proxyConfiguration || null;
         this.sessions = new Map();
         this.proxyDisabled = false;
+        this.warnedNoProxy = false;
+        this.consecutiveFailures = 0;
+        this.circuitOpenUntil = 0;
         this.stats = {
             requests: 0,
             successes: 0,
@@ -84,10 +115,13 @@ export class ResilientHttpClient {
             jar,
             proxyUrl,
             failures: 0,
+            blockFailures: 0,
             requests: 0,
             successes: 0,
             refreshes: 0,
             disabledUntil: 0,
+            lastSuccessAt: 0,
+            csrfToken: '',
             warned: false,
         };
 
@@ -95,40 +129,63 @@ export class ResilientHttpClient {
         return session;
     }
 
-    async refreshSession(session) {
-        if (!this.proxyConfiguration || this.proxyDisabled || session.refreshes >= MAX_PROXY_REFRESHES) return false;
+    // A fresh jar and connection clears any block cookie and stale socket without a proxy.
+    async resetSession(session, { rotateProxy = true } = {}) {
+        let { proxyUrl } = session;
 
-        try {
-            const proxyUrl = await this.proxyConfiguration.newUrl();
-            const jar = new CookieJar();
-            session.client = new Impit({
-                browser: session.profile,
-                cookieJar: jar,
-                timeout: REQUEST_TIMEOUT_MS,
-                ...(proxyUrl && { proxyUrl }),
-            });
-            session.jar = jar;
-            session.proxyUrl = proxyUrl;
-            session.refreshes += 1;
-            session.failures = 0;
-            return true;
-        } catch (error) {
-            this.proxyDisabled = true;
-            log.warning(`Proxy rotation failed, continuing without it: ${error.message}`);
-            return false;
+        if (this.proxyDisabled) {
+            proxyUrl = undefined;
+        } else if (rotateProxy && this.proxyConfiguration && session.refreshes < MAX_PROXY_REFRESHES) {
+            try {
+                proxyUrl = await this.proxyConfiguration.newUrl();
+                session.refreshes += 1;
+            } catch (error) {
+                this.proxyDisabled = true;
+                proxyUrl = undefined;
+                log.warning(`Proxy rotation failed, continuing without it: ${error.message}`);
+            }
+        }
+
+        const jar = new CookieJar();
+        session.client = new Impit({
+            browser: session.profile,
+            cookieJar: jar,
+            timeout: REQUEST_TIMEOUT_MS,
+            ...(proxyUrl && { proxyUrl }),
+        });
+        session.jar = jar;
+        session.proxyUrl = proxyUrl;
+        session.csrfToken = '';
+    }
+
+    async resetFailedSessions() {
+        for (const session of this.sessions.values()) {
+            if (session.failures > 0) {
+                await this.resetSession(session);
+            }
         }
     }
 
-    async recordFailure(session, reason) {
+    async resetAllSessions() {
+        for (const session of this.sessions.values()) {
+            await this.resetSession(session);
+        }
+    }
+
+    async recordFailure(session, reason, blocked) {
         session.failures += 1;
+        session.blockFailures = blocked ? session.blockFailures + 1 : 0;
         this.stats.failures += 1;
 
-        if (session.failures >= 3) {
-            session.disabledUntil = Date.now() + PROFILE_COOLDOWN_MS;
+        if (blocked) {
+            session.disabledUntil = Date.now()
+                + (session.blockFailures >= 3 ? PROFILE_COOLDOWN_MS : TRANSIENT_COOLDOWN_MS);
+        } else {
+            session.disabledUntil = Date.now() + TRANSIENT_COOLDOWN_MS;
         }
 
-        if (session.failures === 2) {
-            await this.refreshSession(session);
+        if (session.failures === 2 || session.blockFailures === 2) {
+            await this.resetSession(session);
         }
 
         if (!session.warned) {
@@ -143,10 +200,15 @@ export class ResilientHttpClient {
         try {
             const cookieString = await session.jar.getCookieString(url);
             const match = cookieString.match(/(?:^|;\s*)CSRFToken=([^;]+)/i);
-            return match ? decodeURIComponent(match[1]) : '';
+            if (match) return decodeURIComponent(match[1]);
+            return session.csrfToken || '';
         } catch {
-            return '';
+            return session.csrfToken || '';
         }
+    }
+
+    circuitRemainingMs() {
+        return Math.max(0, this.circuitOpenUntil - Date.now());
     }
 
     orderedProfiles(preferredSession) {
@@ -158,9 +220,12 @@ export class ResilientHttpClient {
 
         const pool = available.length ? available : [...PROFILE_ORDER];
         pool.sort((left, right) => {
-            const leftFailures = this.sessions.get(left)?.failures ?? 0;
-            const rightFailures = this.sessions.get(right)?.failures ?? 0;
-            return leftFailures - rightFailures;
+            const leftSession = this.sessions.get(left);
+            const rightSession = this.sessions.get(right);
+            const leftFailures = leftSession?.failures ?? 0;
+            const rightFailures = rightSession?.failures ?? 0;
+            if (leftFailures !== rightFailures) return leftFailures - rightFailures;
+            return (rightSession?.lastSuccessAt ?? 0) - (leftSession?.lastSuccessAt ?? 0);
         });
 
         if (preferredSession?.profile) {
@@ -168,12 +233,12 @@ export class ResilientHttpClient {
             if (index > 0) {
                 pool.splice(index, 1);
                 pool.unshift(preferredSession.profile);
-            } else if (index === -1 && available.length) {
+            } else if (index === -1) {
                 pool.unshift(preferredSession.profile);
             }
         }
 
-        return [...new Set(pool)].slice(0, MAX_PROFILE_ATTEMPTS);
+        return [...new Set(pool)];
     }
 
     async request(url, options = {}) {
@@ -183,15 +248,39 @@ export class ResilientHttpClient {
             body,
             isValidBody,
             preferredSession,
+            maxAttempts = MAX_PROFILE_ATTEMPTS,
         } = options;
 
+        if (this.circuitRemainingMs() > 0) {
+            const circuitError = new Error('Request skipped because the site-wide circuit is open after repeated failures');
+            circuitError.circuitOpen = true;
+            throw circuitError;
+        }
+
         const profiles = this.orderedProfiles(preferredSession);
+        const attemptLimit = Math.min(maxAttempts, Math.max(profiles.length, 1));
+        const startedAt = Date.now();
         let lastStatus = null;
         let lastReason = 'no response';
         const failures = [];
 
-        for (const profile of profiles) {
-            const session = await this.getSession(profile);
+        for (let attempt = 0; attempt < attemptLimit; attempt += 1) {
+            if (Date.now() - startedAt >= REQUEST_DEADLINE_MS) {
+                lastReason = 'request deadline exceeded';
+                break;
+            }
+
+            const profile = profiles[attempt % profiles.length];
+            let session;
+
+            try {
+                session = await this.getSession(profile);
+            } catch (error) {
+                lastReason = `session setup failed (${error.message})`;
+                failures.push(`${profile}:setup`);
+                continue;
+            }
+
             session.requests += 1;
             this.stats.requests += 1;
             this.stats.profileUsage[profile] = (this.stats.profileUsage[profile] || 0) + 1;
@@ -229,10 +318,16 @@ export class ResilientHttpClient {
                 }
 
                 if (!blocked && !temporary && valid) {
+                    const inlineToken = extractInlineCsrfToken(text);
+                    if (inlineToken) session.csrfToken = inlineToken;
                     session.failures = 0;
+                    session.blockFailures = 0;
                     session.successes += 1;
                     session.disabledUntil = 0;
+                    session.lastSuccessAt = Date.now();
                     session.warned = false;
+                    this.consecutiveFailures = 0;
+                    this.circuitOpenUntil = 0;
                     this.stats.successes += 1;
 
                     return {
@@ -257,23 +352,50 @@ export class ResilientHttpClient {
                 failures.push(`${profile}:${status}`);
 
                 const retryAfter = parseRetryAfter(response.headers.get('retry-after'));
-                await this.recordFailure(session, lastReason);
+                await this.recordFailure(session, lastReason, blocked);
 
-                if (status === 429 && retryAfter) {
+                if (retryAfter) {
                     await delay(retryAfter);
                 } else {
-                    await delay(jitter(Math.min(400 * session.failures, MAX_BACKOFF_MS)));
+                    await delay(jitter(Math.min(500 * (attempt + 1), MAX_BACKOFF_MS)));
                 }
             } catch (error) {
                 if (error.notFound) throw error;
                 lastReason = error.message;
                 failures.push(`${profile}:error`);
-                await this.recordFailure(session, `network error (${error.message})`);
+                await this.recordFailure(session, `network error (${error.message})`, false);
                 await delay(jitter(300));
             }
         }
 
-        const error = new Error(`Request failed after ${profiles.length} profile attempts (last status: ${lastStatus ?? 'none'}, reason: ${lastReason})`);
+        // Force fresh connections and cookie jars so the next logical request starts clean.
+        try {
+            await this.resetFailedSessions();
+        } catch (error) {
+            log.debug(`Session reset failed: ${error.message}`);
+        }
+
+        this.consecutiveFailures += 1;
+        if (this.consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD) {
+            this.circuitOpenUntil = Date.now() + CIRCUIT_COOLDOWN_MS;
+
+            if (this.proxyConfiguration && !this.proxyDisabled) {
+                this.proxyDisabled = true;
+                log.warning('Repeated proxy failures. Falling back to direct connections for the rest of this run.');
+                try {
+                    await this.resetAllSessions();
+                } catch (error) {
+                    log.debug(`Proxy fallback reset failed: ${error.message}`);
+                }
+            }
+        }
+
+        if (!this.proxyConfiguration && !this.warnedNoProxy) {
+            this.warnedNoProxy = true;
+            log.debug('All browser profiles failed without a proxy; the caller will try its fallback path.');
+        }
+
+        const error = new Error(`Request failed after ${failures.length} attempts (last status: ${lastStatus ?? 'none'}, reason: ${lastReason})`);
         error.failures = failures;
         error.lastStatus = lastStatus;
         throw error;
